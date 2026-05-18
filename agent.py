@@ -662,7 +662,6 @@ def _sanitize_patch(diff_output: str) -> str:
     cleaned = _strip_skipped_file_diffs(diff_output)
     cleaned = _strip_mode_only_file_diffs(cleaned)
     cleaned = _strip_mode_metadata_lines(cleaned)
-    cleaned = _strip_minified_content_diffs(cleaned)
     cleaned = _strip_low_signal_hunks(cleaned)
 
     # Strip content lines containing safety-check trigger substrings while preserving diff headers intact.
@@ -704,54 +703,6 @@ def _diff_block_path(block: str) -> str:
     first = block.splitlines()[0] if block else ""
     match = re.match(r"diff --git a/(.+?) b/(.+)$", first)
     return match.group(2) if match else ""
-
-
-_MINIFIED_AVG_LINE_THRESHOLD = 200
-_MINIFIED_MIN_LINES_TO_CHECK = 5
-
-
-def _strip_minified_content_diffs(diff_output: str) -> str:
-    """Strip diff blocks whose CONTENT looks minified (avg line len >200 chars
-    over >=5 lines). Catches minified bundles even when path doesn't match
-    `*.min.js`-style patterns. Current king filters lockfiles by NAME but
-    NOT minified content by SHAPE.
-    """
-    if not diff_output.strip():
-        return diff_output
-    blocks = re.split(r"(?=^diff --git )", diff_output, flags=re.MULTILINE)
-    kept: List[str] = []
-    for block in blocks:
-        if not block:
-            continue
-        content_lines: List[str] = []
-        for line in block.splitlines():
-            if (line.startswith("diff --git ")
-                or line.startswith("index ")
-                or line.startswith("--- ")
-                or line.startswith("+++ ")
-                or line.startswith("@@")
-                or line.startswith("new file mode")
-                or line.startswith("deleted file mode")
-                or line.startswith("old mode ")
-                or line.startswith("new mode ")
-                or line.startswith("similarity index ")
-                or line.startswith("rename from ")
-                or line.startswith("rename to ")
-                or line.startswith("Binary files ")):
-                continue
-            if line.startswith(("+", "-", " ")):
-                content_lines.append(line[1:])
-        if len(content_lines) < _MINIFIED_MIN_LINES_TO_CHECK:
-            kept.append(block)
-            continue
-        avg_len = sum(len(l) for l in content_lines) / max(1, len(content_lines))
-        if avg_len > _MINIFIED_AVG_LINE_THRESHOLD:
-            continue
-        kept.append(block)
-    result = "".join(kept)
-    if diff_output.endswith("\n") and result and not result.endswith("\n"):
-        result += "\n"
-    return result
 
 
 def _strip_skipped_file_diffs(diff_output: str) -> str:
@@ -1294,7 +1245,6 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
     id_boost = _issue_identifier_path_boost(issue, list(tracked_set))
-    err_boost = _issue_error_string_boost(repo, tracked_set, issue)
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -1319,15 +1269,6 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
             score += 60 + min(40, 8 * symbol_hits[relative_path])
         # Boost files whose path/name matches identifier-shaped tokens from the issue.
         score += 35 * id_boost.get(relative_path, 0)
-        # Boost files containing exact quoted phrases from the issue (error msgs,
-        # expected-output text). High precision: a 20+ char quoted phrase in
-        # the issue usually pins the throw site or its surrounding comments.
-        err_hits = err_boost.get(relative_path, 0)
-        if err_hits:
-            score += min(
-                _ERROR_STRING_MAX_BOOST,
-                _ERROR_STRING_BASE_BOOST + _ERROR_STRING_PER_HIT_BOOST * err_hits,
-            )
         if score > 0:
             scored.append((score, relative_path))
 
@@ -2390,6 +2331,83 @@ def _select_companion_test_failure(
     return None
 
 
+def _companion_test_timeout_seconds(command_timeout: int, remaining_seconds: float) -> int:
+    """Scale companion-test budget with remaining wall-clock without starving the loop."""
+    if remaining_seconds <= _REFINEMENT_TIME_FLOOR_SECONDS:
+        return 8
+    return int(min(max(8, command_timeout // 2), 14, max(8, remaining_seconds // 6)))
+
+
+def _suggest_targeted_test_command(repo: Path, patch: str) -> Optional[str]:
+    """Return a single repo-local verification command for edited companion tests."""
+    edited = _patch_changed_files(patch)
+    if not edited:
+        return None
+    tracked = set(_tracked_files(repo))
+    for relative_path in edited:
+        partner = _find_test_partner(relative_path, tracked)
+        if not partner:
+            continue
+        suffix = Path(partner).suffix.lower()
+        if suffix == ".py":
+            return f"pytest {partner} -x -q --tb=short"
+        if suffix in {".ts", ".tsx", ".js", ".jsx"}:
+            return f"npm test -- {partner}"
+        if suffix == ".go":
+            pkg = str(Path(partner).parent) or "."
+            return f"go test {pkg} -count=1"
+        if suffix == ".rs":
+            return "cargo test --offline -q"
+    return None
+
+
+def _patch_ship_blockers(patch: str, issue: str) -> List[str]:
+    """Structural gaps that correlate with losing duels vs king."""
+    if not patch.strip():
+        return ["empty_patch"]
+    blockers: List[str] = []
+    if not _patch_covers_required_paths(patch, issue):
+        blockers.append("required_paths_uncovered")
+    if _issue_requires_deletion(issue) and not _patch_has_deletions(patch):
+        blockers.append("missing_required_deletions")
+    if _issue_implies_relocation(issue) and not _patch_creates_any_new_file(patch):
+        blockers.append("relocation_incomplete")
+    if len(_unaddressed_criteria(patch, issue)) >= 2:
+        blockers.append("criteria_mostly_unaddressed")
+    return blockers
+
+
+def _patch_duel_score(patch: str, issue: str) -> int:
+    """Rank candidate patches for multishot winner selection (higher is better)."""
+    if not patch.strip():
+        return 0
+    score = _multishot_count_substantive(patch) * 10
+    if _patch_covers_required_paths(patch, issue):
+        score += 30
+    unaddressed = _unaddressed_criteria(patch, issue)
+    score += max(0, 35 - 12 * len(unaddressed))
+    if _issue_requires_deletion(issue):
+        if _patch_has_deletions(patch):
+            score += 20
+    if _issue_implies_relocation(issue) and _patch_creates_any_new_file(patch):
+        score += 25
+    score -= 18 * len(_patch_ship_blockers(patch, issue))
+    return score
+
+
+def build_ship_blocker_prompt(blockers: List[str], issue: str) -> str:
+    short = issue[:1200] if len(issue) > 1200 else issue
+    items = "\n".join(f"  - {b}" for b in blockers[:6])
+    return (
+        "Your patch is not ready to ship yet. The solver detected these gaps:\n"
+        f"{items}\n\n"
+        "Address the highest-priority gap with the smallest additional edit(s), "
+        "run a targeted verification command, then emit <final>summary</final>.\n\n"
+        "Task reminder:\n"
+        f"{short}\n"
+    )
+
+
 def _recent_commit_examples(repo: Path) -> str:
     """v21 edge: read recent small-diff commits from the staged repo via git log
     and format them as in-context style anchors. Returns empty string when the
@@ -2728,82 +2746,6 @@ _HOOK_RE = re.compile(r"\b(use|get|set|fetch|handle|build|create)[A-Z][a-zA-Z0-9
 _SNAKE_RE = re.compile(r"\b([a-z][a-zA-Z0-9]+_[a-z][a-zA-Z0-9_]+)\b")
 
 
-# Error-string file boost: a file-selection signal NOT exploited by any of the
-# last 7 king PRs (verified through fd2af7a). Kings boost via path mentions,
-# backtick idents, snake/Camel idents, symbol grep, integration partners,
-# sibling dirs, needles — but never via the exact quoted English phrases
-# (error messages, expected output) that issues routinely include verbatim
-# at the throw site or in nearby comments.
-_QUOTED_STRING_RE = re.compile(r"`([^`\n]+)`|\"([^\"\n]+)\"|'([^'\n]+)'")
-_ERROR_STRING_MIN_LEN = 20
-_ERROR_STRING_MAX_LEN = 200
-_ERROR_STRING_MAX_PATTERNS = 5
-_ERROR_STRING_MAX_FILES_PER_PATTERN = 10
-_ERROR_STRING_BASE_BOOST = 70
-_ERROR_STRING_PER_HIT_BOOST = 30
-_ERROR_STRING_MAX_BOOST = 130
-
-
-def _issue_error_string_boost(
-    repo: Path,
-    tracked_set: set,
-    issue_text: str,
-) -> Dict[str, int]:
-    """Boost files containing quoted phrases from the issue. Error messages
-    and exact-text quotes (>=20 chars, with whitespace) appear verbatim at
-    the throw site or in nearby comments. Per-string match cap drops generic
-    phrases that match too many files.
-    """
-    candidates: List[str] = []
-    seen: set = set()
-    for m in _QUOTED_STRING_RE.finditer(issue_text):
-        for group in m.groups():
-            if not group:
-                continue
-            s = group.strip()
-            if len(s) < _ERROR_STRING_MIN_LEN or " " not in s:
-                continue
-            if len(s) > _ERROR_STRING_MAX_LEN:
-                continue
-            if s in seen:
-                continue
-            seen.add(s)
-            candidates.append(s)
-            if len(candidates) >= _ERROR_STRING_MAX_PATTERNS:
-                break
-        if len(candidates) >= _ERROR_STRING_MAX_PATTERNS:
-            break
-
-    if not candidates:
-        return {}
-
-    boost: Dict[str, int] = {}
-    for pattern in candidates:
-        try:
-            proc = subprocess.run(
-                ["git", "grep", "-l", "-F", "--", pattern],
-                cwd=str(repo),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=2,
-            )
-        except Exception:
-            continue
-        if proc.returncode not in (0, 1):
-            continue
-        matched_paths = [p.strip() for p in proc.stdout.splitlines() if p.strip()]
-        if len(matched_paths) > _ERROR_STRING_MAX_FILES_PER_PATTERN:
-            continue
-        for rel in matched_paths:
-            if rel not in tracked_set:
-                continue
-            if not _context_file_allowed(rel):
-                continue
-            boost[rel] = boost.get(rel, 0) + 1
-    return boost
-
-
 def _issue_identifier_path_boost(
     issue_text: str, tracked_files: List[str], cap: int = 20
 ) -> Dict[str, int]:
@@ -3082,6 +3024,9 @@ When multiple files need edits, include EVERY independent edit command in the SA
 
 After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./...`, etc.) to verify correctness. Then finish with <final>...</final>.
 """
+
+
+
 
 
 _PRELOAD_BLOCK_RE = re.compile(
@@ -3575,13 +3520,7 @@ _LOCKFILE_BASENAMES = {
 }
 
 
-_EMERGENCY_MAX_TIERED_CANDIDATES = 5
-_EMERGENCY_TIERED_SNIPPET_CHARS = 600  # smaller per-candidate so all 5 fit
-
-
 def _emergency_pick_target(repo: Path, task_text: str) -> Optional[str]:
-    """Legacy single-target picker. Retained as a fallback when the tiered
-    picker yields no candidates."""
     mentioned_paths = _extract_issue_path_mentions(task_text)
     tracked = set(_tracked_files(repo))
     for mention in mentioned_paths:
@@ -3598,85 +3537,7 @@ def _emergency_pick_target(repo: Path, task_text: str) -> Optional[str]:
     return None
 
 
-def _emergency_pick_tiered_targets(repo: Path, task_text: str) -> List[Tuple[str, str]]:
-    """Return up to N (path, reason) pairs ranked by relevance — issue
-    mentions first, then `_rank_context_files` ordering. The emergency LLM
-    sees all of them with reasons and picks via its own judgment, instead
-    of being forced into the single legacy pick. Untried by any prior king.
-    """
-    out: List[Tuple[str, str]] = []
-    seen: set = set()
-    mentioned_paths = _extract_issue_path_mentions(task_text)
-    tracked = set(_tracked_files(repo))
-    for mention in mentioned_paths:
-        normalized = mention.strip("./")
-        if (normalized in tracked
-                and _context_file_allowed(normalized)
-                and normalized not in seen):
-            out.append((normalized, "issue-mention"))
-            seen.add(normalized)
-            if len(out) >= _EMERGENCY_MAX_TIERED_CANDIDATES:
-                return out
-    try:
-        ranked, _top_score = _rank_context_files(repo, task_text)
-    except Exception:
-        ranked = []
-    for relative_path in ranked:
-        if (relative_path in tracked
-                and _context_file_allowed(relative_path)
-                and relative_path not in seen):
-            out.append((relative_path, "ranked"))
-            seen.add(relative_path)
-            if len(out) >= _EMERGENCY_MAX_TIERED_CANDIDATES:
-                return out
-    if not out:
-        for relative_path in tracked:
-            if _context_file_allowed(relative_path):
-                out.append((relative_path, "fallback"))
-                break
-    return out
-
-
-def _emergency_build_tiered_prompt(
-    candidates: List[Tuple[str, str]],
-    snippets: List[str],
-    task_text: str,
-) -> str:
-    """Build an emergency prompt that presents the model with N ranked
-    candidates plus their snippets. The model picks ONE and patches it.
-
-    Improves emergency hit-rate vs the single-target prompt: when the
-    heuristically-ranked top file is wrong, the model can override that
-    choice using its semantic understanding of the issue.
-    """
-    task_view = task_text[:1500]
-    candidate_blocks: List[str] = []
-    for idx, ((path, reason), snippet) in enumerate(zip(candidates, snippets), start=1):
-        candidate_blocks.append(
-            f"--- CANDIDATE {idx} ({reason}) ---\n"
-            f"PATH: {path}\n"
-            f"SNIPPET:\n```\n{snippet}\n```"
-        )
-    candidates_section = "\n\n".join(candidate_blocks)
-    return (
-        "You are a one-shot patch generator. Time and tokens are extremely "
-        "limited. You may emit ONLY one bash command followed by <final>.\n\n"
-        f"TASK:\n{task_view}\n\n"
-        f"You have {len(candidates)} candidate target file(s) below — they were "
-        "heuristically ranked but the top one is not always right. Use the "
-        "task context to pick the SINGLE best target, then patch it.\n\n"
-        f"{candidates_section}\n\n"
-        "Emit EXACTLY ONE bash command that makes the smallest substantive "
-        "code change in your chosen target file. Use `sed -i`, a "
-        "`python -c` one-liner, or a heredoc. Do NOT add comments only. "
-        "Do NOT change file modes. Make a real code edit.\n\n"
-        "Format:\n<command>\nyour single command here\n</command>\n"
-        "<final>emergency edit</final>"
-    )
-
-
 def _emergency_build_prompt(target: str, snippet: str, task_text: str) -> str:
-    """Single-target prompt — kept for fallback if tiered picker fails."""
     task_view = task_text[:1500]
     return (
         "You are a one-shot patch generator. Time and tokens are extremely "
@@ -3704,23 +3565,11 @@ def _solve_emergency_single_shot(**kwargs: Any) -> Dict[str, Any]:
         repo = _repo_path(repo_path_value)
         ensure_git_repo(repo)
         model_name, base, key = _resolve_inference_config(model, api_base, api_key)
-        # Multi-tier emergency: present up to N ranked candidates and let the
-        # model pick. Falls back to legacy single-target if tiered pick fails.
-        tiered = _emergency_pick_tiered_targets(repo, task_text)
-        if tiered:
-            snippets = [
-                _read_context_file(repo, path, _EMERGENCY_TIERED_SNIPPET_CHARS)
-                for (path, _reason) in tiered
-            ]
-            prompt = _emergency_build_tiered_prompt(tiered, snippets, task_text)
-            target = tiered[0][0]
-            logs.append(f"EMERGENCY_TIERED_TARGETS: {[p for p, _ in tiered]}")
-        else:
-            target = _emergency_pick_target(repo, task_text)
-            if target is None:
-                return AgentResult(patch="", logs=_safe_join_logs(logs + ["EMERGENCY_NO_TARGET"]), steps=0, cost=0.0, success=False).to_dict()
-            snippet = _read_context_file(repo, target, _EMERGENCY_PROMPT_TARGET_CHARS)
-            prompt = _emergency_build_prompt(target, snippet, task_text)
+        target = _emergency_pick_target(repo, task_text)
+        if target is None:
+            return AgentResult(patch="", logs=_safe_join_logs(logs + ["EMERGENCY_NO_TARGET"]), steps=0, cost=0.0, success=False).to_dict()
+        snippet = _read_context_file(repo, target, _EMERGENCY_PROMPT_TARGET_CHARS)
+        prompt = _emergency_build_prompt(target, snippet, task_text)
         messages = [
             {"role": "system", "content": "You are a one-shot patch generator. Output exactly one bash command then <final>summary</final>."},
             {"role": "user", "content": prompt},
@@ -3775,228 +3624,6 @@ def _strip_lockfile_diffs_unless_mentioned(patch: str, issue_text: str) -> str:
         return patch
 
 
-_STYLE_REWRITER_MAX_PATCH_CHARS = 6000   # skip huge patches (token cost + minified risk)
-_STYLE_REWRITER_MAX_TOKENS = 2500
-_STYLE_REWRITER_TIMEOUT = 40
-_STYLE_REWRITER_MIN_RECENT_EXAMPLES_CHARS = 200
-
-
-def _patch_diff_files(patch: str) -> set:
-    """Set of `b/<path>` files touched by the patch (parsed from diff headers)."""
-    out: set = set()
-    for line in patch.splitlines():
-        if line.startswith("diff --git "):
-            parts = line.split()
-            if len(parts) >= 4 and parts[3].startswith("b/"):
-                out.add(parts[3][2:])
-    return out
-
-
-def _judge_best_patch(
-    patches: List[str],
-    issue_text: str,
-    model: Optional[str],
-    api_base: Optional[str],
-    api_key: Optional[str],
-) -> int:
-    """Use the LLM to pick the best of N patches for an issue. Returns the
-    index of the picked patch, or 0 on any failure (original).
-
-    Novel mechanic — no king does post-solve LLM-judge-based patch selection.
-    King's parallel branches use a heuristic (substantive line count) to pick.
-    LLM judge picks by SEMANTIC quality which captures more dimensions.
-    """
-    if not patches or len(patches) == 1:
-        return 0
-    # Build labeled patches A, B, C
-    labels = "ABCDE"
-    block_lines: List[str] = []
-    for i, p in enumerate(patches):
-        block_lines.append(f"=== PATCH {labels[i]} ===\n```diff\n{p[:3500]}\n```")
-    blocks = "\n\n".join(block_lines)
-    prompt = (
-        f"You are picking the BEST patch for an issue. {len(patches)} candidates "
-        "below — they all aim to fix the same issue but with different "
-        "style/scope/completeness tradeoffs. Pick the ONE most likely to "
-        "score highest with a strict code-review judge.\n\n"
-        f"ISSUE:\n{issue_text[:1200]}\n\n"
-        f"{blocks}\n\n"
-        "Decision criteria (in priority order):\n"
-        "1. CORRECTNESS — does the patch actually fix the issue's root cause?\n"
-        "2. COMPLETENESS — does it cover every requirement / edge case named?\n"
-        "3. SCOPE — minimal? No comment-only changes, no unused helpers?\n"
-        "4. STYLE — does it look like a real maintainer commit?\n\n"
-        f"Output exactly ONE character — the letter of your pick ({labels[:len(patches)]}). "
-        "No prose, no explanation. Just the single letter."
-    )
-    try:
-        text, _latency, _meta = chat_completion(
-            messages=[
-                {"role": "system", "content": "You are a strict code-patch judge. Output exactly one letter."},
-                {"role": "user", "content": prompt},
-            ],
-            model=model, api_base=api_base, api_key=api_key,
-            max_tokens=10, timeout=25, max_retries=1,
-        )
-    except Exception:
-        return 0
-    if not text:
-        return 0
-    text = text.strip().upper()
-    for char in text:
-        if char in labels[:len(patches)]:
-            return labels.index(char)
-    return 0
-
-
-def _run_style_rewriter(
-    patch_text: str,
-    issue_text: str,
-    repo: Optional[Path],
-    model: Optional[str],
-    api_base: Optional[str],
-    api_key: Optional[str],
-) -> Optional[str]:
-    """Solver-quality polish: review the produced patch against this repo's
-    recent maintainer commits and clean it up.
-
-    Many models emit patches with leftover scratch (comment-only edits, blank
-    line churn, over-eager defensive checks, hunks unrelated to the issue's
-    actual ask). A short review pass against the repo's own commit history
-    teaches the model concrete in-repo conventions for hunk shape and edit
-    density, helping it drop the scratch and keep the actual fix.
-
-    Two variants are produced (style-focused and minimalism-focused), and a
-    short LLM-judge call picks the best of {original, A, B}. If the judge
-    prefers the original, no change is applied. All variants are validated
-    against scope-creep and size sanity before being shown to the judge.
-
-    Fails open: any validation failure or API error returns None so the
-    original patch flows through unchanged.
-    """
-    if not patch_text.strip() or repo is None:
-        return None
-    if len(patch_text) > _STYLE_REWRITER_MAX_PATCH_CHARS:
-        return None  # huge patches usually means edge case; don't risk a rewrite
-    try:
-        examples = _recent_commit_examples(repo)
-    except Exception:
-        examples = ""
-    if not examples or len(examples) < _STYLE_REWRITER_MIN_RECENT_EXAMPLES_CHARS:
-        return None  # no style anchors available
-
-    original_files = _patch_diff_files(patch_text)
-    if not original_files:
-        return None  # malformed input, skip
-
-    # Two-variant ensemble: A=maintainer-style polish, B=minimalism polish.
-    # Each is a separate LLM call producing a different variant of the patch.
-    # An LLM judge then picks the best of {P0, A, B}.
-    variant_a_prompt = (
-        "You are a code-style polisher. Below is a current patch and 1-2 "
-        "examples of how this repo's maintainers actually wrote recent fixes "
-        "(real commits from `git log` of the working repo).\n\n"
-        f"MAINTAINER COMMITS (style anchors — match their style):\n"
-        f"{examples[:1500]}\n\n"
-        f"CURRENT PATCH:\n```diff\n{patch_text[:5000]}\n```\n\n"
-        f"ISSUE (for context, not to expand scope):\n{issue_text[:800]}\n\n"
-        "Task: produce a NEW patch that:\n"
-        "1. Keeps the SAME semantic fix — same files, same lines functionally "
-        "edited, same logic. Do not change WHAT the patch does.\n"
-        "2. Adjusts STYLE only to match the maintainer commits: hunk shape, "
-        "indentation, comment density, variable-naming conventions, "
-        "trailing-newline behaviour.\n"
-        "3. REMOVES scope-creep: comment-only edits, unrelated whitespace, "
-        "unused helper additions, blank-line-only hunks.\n\n"
-        "If the current patch is already well-aligned, output it unchanged. "
-        "Output ONLY the diff in this exact format:\n\n"
-        "```diff\n"
-        "<full unified diff here>\n"
-        "```"
-    )
-    variant_b_prompt = (
-        "You are a minimalism enforcer. Below is a current patch and the issue "
-        "it is meant to fix. Your goal: produce the SMALLEST possible patch "
-        "that still fixes the issue, removing every line that isn't strictly "
-        "required.\n\n"
-        f"MAINTAINER COMMITS (showing the minimal style this repo uses):\n"
-        f"{examples[:1500]}\n\n"
-        f"CURRENT PATCH:\n```diff\n{patch_text[:5000]}\n```\n\n"
-        f"ISSUE:\n{issue_text[:800]}\n\n"
-        "Task: produce a NEW patch that:\n"
-        "1. Keeps ONLY the code changes that DIRECTLY fix the issue.\n"
-        "2. REMOVES every comment added by the agent, every helper function "
-        "not strictly required, every speculative defensive check, every "
-        "whitespace-only or blank-line-only hunk.\n"
-        "3. Same files, same fix direction, but the LEAST CODE possible.\n\n"
-        "Output ONLY the diff in this exact format:\n\n"
-        "```diff\n"
-        "<full unified diff here>\n"
-        "```"
-    )
-
-    def _try_variant(prompt: str, system_msg: str) -> Optional[str]:
-        try:
-            text, _l, _m = chat_completion(
-                messages=[
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": prompt},
-                ],
-                model=model,
-                api_base=api_base,
-                api_key=api_key,
-                max_tokens=_STYLE_REWRITER_MAX_TOKENS,
-                timeout=_STYLE_REWRITER_TIMEOUT,
-                max_retries=1,
-            )
-        except Exception:
-            return None
-        if not text or not text.strip():
-            return None
-        m = re.search(r"```(?:diff)?\s*\n(.*?)```", text, re.DOTALL)
-        if not m:
-            return None
-        out = m.group(1).strip()
-        if not out or not out.startswith("diff --git"):
-            return None
-        out_files = _patch_diff_files(out)
-        if out_files != original_files:
-            return None  # scope-creep guard
-        if len(out) > len(patch_text) * 1.6:
-            return None
-        if len(out) < len(patch_text) * 0.20:
-            return None
-        if not out.endswith("\n"):
-            out += "\n"
-        return out
-
-    variant_a = _try_variant(
-        variant_a_prompt,
-        "You are a careful code-style polisher. Output exactly one unified-diff block. No other text.",
-    )
-    variant_b = _try_variant(
-        variant_b_prompt,
-        "You are a strict minimalism enforcer. Output exactly one unified-diff block. No other text.",
-    )
-
-    # Build candidates list with the original always at index 0
-    candidates: List[str] = [patch_text]
-    if variant_a and variant_a != patch_text:
-        candidates.append(variant_a)
-    if variant_b and variant_b != patch_text and variant_b != variant_a:
-        candidates.append(variant_b)
-
-    if len(candidates) == 1:
-        return None  # nothing to pick from — keep original
-
-    # LLM judge picks the best of {P0, A, B}
-    picked = _judge_best_patch(candidates, issue_text, model, api_base, api_key)
-    chosen = candidates[picked]
-    if chosen == patch_text:
-        return None  # judge picked original — no change needed
-    return chosen
-
-
 def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
     if not patch_text.strip():
         return True
@@ -4049,7 +3676,7 @@ def solve(
 
 
 def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
-    """Multi-shot solve with emergency rescue + lockfile-strip + style-rewriter post-process."""
+    """Multi-shot solve with emergency rescue + lockfile-strip post-process."""
     repo_path = kwargs["repo_path"]
     _issue_text = kwargs.get("issue", "") or ""
     _multishot_repo_obj = None
@@ -4066,18 +3693,6 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
                 if stripped != patch_text:
                     result["patch"] = stripped
                     result["lockfile_stripped"] = True
-                    patch_text = stripped
-                # Solver-quality review pass: short review against the repo's own
-                # recent commits to clean up scratch (comment-only edits, blank-line
-                # churn, defensive checks the issue did not ask for). Time-bounded;
-                # falls back to original on any failure or unsafe rewrite.
-                polished = _run_style_rewriter(
-                    patch_text, _issue_text, _multishot_repo_obj,
-                    kwargs.get("model"), kwargs.get("api_base"), kwargs.get("api_key"),
-                )
-                if polished and polished != patch_text:
-                    result["patch"] = polished
-                    result["style_rewrite_applied"] = True
         except Exception:
             pass
         return result
@@ -4129,13 +3744,24 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _remaining = _MULTISHOT_TOTAL_BUDGET - _elapsed
         _attempt2_budget = max(30.0, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE)
         _bootstrap = build_attempt2_bootstrap(_result1, _n1)
+        _attempt1_blockers = _patch_ship_blockers(_patch1, _issue_text)
+        if _attempt1_blockers:
+            _bootstrap += (
+                "\nAttempt-1 ship blockers to fix on retry: "
+                + ", ".join(_attempt1_blockers)
+                + "\n"
+            )
         _result2 = _solve_attempt(**{**kwargs, "_wall_clock_budget": _attempt2_budget, "_prior_attempt_summary": _bootstrap})
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
+        _score1 = _patch_duel_score(_patch1, _issue_text)
+        _score2 = _patch_duel_score(_patch2, _issue_text)
 
-        if _n2 >= _n1:
+        if _score2 > _score1 or (_score2 == _score1 and _n2 >= _n1):
             _result2["multishot_attempts"] = 2
             _result2["multishot_winner"] = "retry"
+            _result2["multishot_score_primary"] = _score1
+            _result2["multishot_score_retry"] = _score2
             return _finalize(_maybe_emergency(_result2, _multishot_started))
 
         if _multishot_repo_obj is not None:
@@ -4197,7 +3823,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
     wall_clock_budget = float(kwargs.get("_wall_clock_budget", WALL_CLOCK_BUDGET_SECONDS))
     prior_attempt_summary = kwargs.get("_prior_attempt_summary", "")
-
     repo: Optional[Path] = None
     logs: List[str] = []
     total_cost: Optional[float] = 0.0
@@ -4217,6 +3842,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     must_edit_patch = ""
     gap_edit_nudges_used = 0
     deletion_nudges_used = 0
+    ship_blocker_nudges_used = 0
+    verification_nudges_used = 0
+    last_verification_step = 0
     solve_started_at = time.monotonic()
 
     def time_remaining() -> float:
@@ -4234,6 +3862,29 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         logs.append(f"\n{marker}\n")
         messages.append({"role": "assistant", "content": assistant_text})
         messages.append({"role": "user", "content": prompt_text})
+
+    def try_block_premature_success(patch: str, assistant_text: str) -> bool:
+        """Return True when the loop should continue instead of declaring success."""
+        nonlocal ship_blocker_nudges_used
+        blockers = _patch_ship_blockers(patch, issue)
+        if not blockers:
+            return False
+        if maybe_queue_refinement(assistant_text):
+            return True
+        if (
+            ship_blocker_nudges_used < 1
+            and time_remaining() >= _REFINEMENT_TIME_FLOOR_SECONDS
+        ):
+            ship_blocker_nudges_used += 1
+            messages.append({"role": "assistant", "content": assistant_text})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": build_ship_blocker_prompt(blockers, issue),
+                }
+            )
+            return True
+        return False
 
     def maybe_queue_refinement(assistant_text: str) -> bool:
         """If the current patch warrants a refinement turn, queue it.
@@ -4331,17 +3982,14 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # Companion-test execution gate. The previous king alexlange1 (PR #44)
-        # shipped MAX_TEST_FIX_TURNS, build_test_fix_prompt, and the
-        # _TEST_PARTNER_TEMPLATES preloading list, but never invoked any of
-        # them from solve(). The +1269 line PR #185 rewrite kept the dead
-        # scaffolding without using it. We re-introduce the runtime
-        # correctness signal: if any edited file has a partner test that
-        # actually fails, surface the failure tail to the model as one fix
-        # turn. This is the only refinement step in the chain backed by a
-        # real runner rather than heuristics.
         if test_fix_turns_used < MAX_TEST_FIX_TURNS:
-            failure = _select_companion_test_failure(repo, patch)
+            failure = _select_companion_test_failure(
+                repo,
+                patch,
+                test_timeout_seconds=_companion_test_timeout_seconds(
+                    command_timeout, time_remaining()
+                ),
+            )
             if failure is not None:
                 test_path, output = failure
                 test_fix_turns_used += 1
@@ -4476,6 +4124,14 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             (prior_attempt_summary if prior_attempt_summary else "")
             + build_initial_user_prompt(issue, repo_summary, preloaded_context)
         )
+        _acceptance_criteria = _extract_acceptance_criteria(issue)
+        if _acceptance_criteria:
+            _criteria_lines = "\n".join(f"  - {c}" for c in _acceptance_criteria[:_CRITERIA_MAX_BULLETS])
+            _initial_user_content += (
+                "\n\nAcceptance criteria checklist (address each before <final>):\n"
+                f"{_criteria_lines}\n"
+            )
+
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": _initial_user_content},
@@ -4597,6 +4253,9 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
             if not commands:
                 if final is not None:
+                    _final_patch = get_patch(repo)
+                    if _final_patch.strip() and try_block_premature_success(_final_patch, response_text):
+                        continue
                     if maybe_queue_refinement(response_text):
                         continue
                     logs.append("\nFINAL_SUMMARY:\n" + final)
@@ -4605,6 +4264,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 consecutive_no_command += 1
                 patch = get_patch(repo)
                 if patch.strip():
+                    if try_block_premature_success(patch, response_text):
+                        continue
                     if maybe_queue_refinement(response_text):
                         continue
                     logs.append("\nPATCH_READY:\nModel stopped issuing commands after creating a patch.")
@@ -4623,8 +4284,11 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             command_batch = commands[:MAX_COMMANDS_PER_RESPONSE]
 
             for command_index, command in enumerate(command_batch, 1):
+                if _looks_like_verification_command(command):
+                    last_verification_step = step
                 result = run_command(command, repo, timeout=command_timeout)
                 observation = format_observation(result)
+
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
 
@@ -4633,10 +4297,33 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     if patch.strip() and _looks_like_successful_test_output(observation, command):
                         if maybe_queue_refinement(response_text):
                             break  # refinement queued — re-enter outer loop next iteration
+                        if (
+                            test_fix_turns_used < MAX_TEST_FIX_TURNS
+                            and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS
+                            and time_remaining() >= _REFINEMENT_TIME_FLOOR_SECONDS
+                        ):
+                            _ct_timeout = _companion_test_timeout_seconds(
+                                command_timeout, time_remaining()
+                            )
+                            failure = _select_companion_test_failure(
+                                repo, patch, test_timeout_seconds=_ct_timeout
+                            )
+                            if failure is not None:
+                                test_path, output = failure
+                                test_fix_turns_used += 1
+                                total_refinement_turns_used += 1
+                                queue_refinement_turn(
+                                    response_text,
+                                    build_test_fix_prompt(test_path, output),
+                                    f"COMPANION_TEST_BLOCKED_AUTO_STOP:\n  {test_path}",
+                                )
+                                break
                         logs.append("\nAUTO_STOP:\nPatch exists and latest command looked like successful tests.")
                         success = True
                         break
                     if patch.strip() and result.timed_out:
+                        if try_block_premature_success(patch, response_text):
+                            break
                         if maybe_queue_refinement(response_text):
                             break
                         logs.append("\nPATCH_READY:\nPatch exists and latest command exceeded the local command timeout.")
@@ -4659,6 +4346,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
 
             if final is not None and get_patch(repo).strip():
+                if try_block_premature_success(get_patch(repo), response_text):
+                    if success:
+                        break
+                    continue
                 if maybe_queue_refinement(response_text):
                     # Refinement turn queued; do not declare success yet. Skip
                     # the observation append below since queue_refinement_turn
@@ -4672,12 +4363,19 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             if observations:
                 observation_text = "\n\n".join(observations)
                 if not success and get_patch(repo).strip():
+                    _verify_hint = _suggest_targeted_test_command(repo, get_patch(repo))
+                    _verify_line = (
+                        f"Suggested targeted verification: `{_verify_hint}`\n"
+                        if _verify_hint
+                        else ""
+                    )
                     observation_text += (
                         "\n\nPatch now exists. Next steps (all in ONE response):\n"
                         "1. Any remaining file edits or companion test updates.\n"
-                        "2. Run the most targeted functional test available "
-                        "(`pytest tests/test_<module>.py -x -q`, `go test ./...`, etc.) "
-                        "to verify correctness — passing tests are strong evidence for the final patch.\n"
+                        f"2. Run the most targeted functional test available "
+                        f"(`pytest tests/test_<module>.py -x -q`, `go test ./...`, etc.) "
+                        f"to verify correctness — passing tests are strong evidence for the final patch.\n"
+                        f"{_verify_line}"
                         "3. Emit <final>summary</final>."
                     )
                 elif not success:
@@ -4687,6 +4385,29 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         "in the issue. Use sed or python -c for surgical edits."
                     )
                 messages.append({"role": "user", "content": observation_text})
+
+            if (
+                not success
+                and get_patch(repo).strip()
+                and verification_nudges_used < 1
+                and step >= 5
+                and last_verification_step < step - 2
+                and time_remaining() >= _REFINEMENT_TIME_FLOOR_SECONDS
+            ):
+                _late_verify = _suggest_targeted_test_command(repo, get_patch(repo))
+                if _late_verify:
+                    verification_nudges_used += 1
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "You have a patch but have not run a targeted verification "
+                                f"recently. Run this command next, then fix any failures:\n"
+                                f"  `{_late_verify}`"
+                            ),
+                        }
+                    )
+                    continue
 
             if success:
                 break
@@ -4742,6 +4463,9 @@ def _looks_like_successful_test_output(observation: str, command: str = "") -> b
         "assertionerror",
         "syntaxerror",
         "exception",
+        "no tests ran",
+        "collected 0 items",
+        "0 passed",
     ]
 
     good_markers = [
@@ -4759,10 +4483,8 @@ def _looks_like_successful_test_output(observation: str, command: str = "") -> b
     if stderr_body and any(marker in stderr_body for marker in bad_markers):
         has_bad = True
 
-    if exit_code == 0 and not has_bad:
-        return True
-
-    return (exit_code == 0 or has_good) and has_good and not has_bad
+    # Require positive pass evidence; exit code 0 alone is not enough.
+    return exit_code == 0 and has_good and not has_bad
 
 
 def _looks_like_verification_command(command: str) -> bool:
