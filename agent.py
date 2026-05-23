@@ -4474,6 +4474,88 @@ def _strip_lockfile_diffs_unless_mentioned(patch: str, issue_text: str) -> str:
         return patch
 
 
+_HUNK_HEADER_RE = re.compile(
+    r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$"
+)
+
+
+def _repair_hunk_header_counts(patch: str) -> str:
+    """Rewrite each unified-diff hunk header so its line counts match the
+    actual body of the hunk. Many `git apply` failures on LLM-generated
+    patches are caused by stale `-a,b +c,d` counts that do not match the
+    lines that follow (e.g. when the model trims a trailing context line
+    or duplicates a removal). Recomputing the counts in-place is a safe,
+    semantics-preserving repair: the hunk content is untouched; only the
+    header's two count fields are adjusted to match reality.
+
+    The starting line numbers (`a` and `c`) and any trailing function-name
+    section header are preserved verbatim. If no header is found or the
+    patch is empty, the input is returned unchanged.
+    """
+    if not patch.strip() or "@@" not in patch:
+        return patch
+    try:
+        # Preserve the original newline style: count line endings, then split.
+        had_trailing_newline = patch.endswith("\n")
+        lines = patch.split("\n")
+        out: List[str] = []
+        i = 0
+        n = len(lines)
+        while i < n:
+            line = lines[i]
+            m = _HUNK_HEADER_RE.match(line)
+            if not m:
+                out.append(line)
+                i += 1
+                continue
+            old_start = m.group(1)
+            new_start = m.group(3)
+            tail = m.group(5) or ""
+            # Scan forward to the next hunk header / file header / EOF.
+            body_start = i + 1
+            j = body_start
+            minus_count = 0
+            plus_count = 0
+            while j < n:
+                bl = lines[j]
+                if bl.startswith("@@ ") or bl.startswith("diff --git ") \
+                   or bl.startswith("--- ") or bl.startswith("+++ "):
+                    break
+                if not bl:
+                    # A truly empty line inside a hunk body is invalid in a
+                    # well-formed unified diff (context lines begin with a
+                    # space). Treat as end-of-hunk to avoid mis-counting.
+                    # An empty final line at EOF is harmless trailing.
+                    if j == n - 1:
+                        j += 1
+                    break
+                first = bl[0]
+                if first == "-":
+                    minus_count += 1
+                elif first == "+":
+                    plus_count += 1
+                elif first == " ":
+                    minus_count += 1
+                    plus_count += 1
+                elif first == "\\":
+                    # "\\ No newline at end of file" marker — does not count.
+                    pass
+                else:
+                    # Unknown line prefix; stop counting to stay safe.
+                    break
+                j += 1
+            new_header = "@@ -" + old_start + "," + str(minus_count) \
+                + " +" + new_start + "," + str(plus_count) + " @@" + tail
+            out.append(new_header)
+            i += 1
+        result = "\n".join(out)
+        if had_trailing_newline and not result.endswith("\n"):
+            result += "\n"
+        return result
+    except Exception:
+        return patch
+
+
 def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
     if not patch_text.strip():
         return True
@@ -4543,6 +4625,10 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
                 if stripped != patch_text:
                     result["patch"] = stripped
                     result["lockfile_stripped"] = True
+                repaired = _repair_hunk_header_counts(result["patch"])
+                if repaired != result["patch"]:
+                    result["patch"] = repaired
+                    result["hunk_headers_repaired"] = True
                 # Always-on cosmetic divergence: trailing-whitespace strip
                 # on added lines + cap consecutive blank-added-lines at 2.
                 # Same semantic content, different bytes.
