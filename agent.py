@@ -95,6 +95,11 @@ MAX_PRELOADED_FILES = 22              # rounds on issues spanning multiple modul
 MAX_NO_COMMAND_REPAIRS = 2
 MAX_COMMANDS_PER_RESPONSE = 25
 
+# Loop guards and companion-test targeting.
+COMMAND_LOOP_THRESHOLD = 5
+COMMAND_LOOP_SIG_WINDOW = 8
+CONSECUTIVE_CMD_FAILURE_THRESHOLD = 3
+
 # Anti-whiff knobs. Empty patches score zero on baseline-similarity, so any
 # transient model error or stuck loop directly costs us rounds. Be aggressive
 # about retrying instead of returning early with no edits.
@@ -655,6 +660,23 @@ def extract_final(model_text: str) -> Optional[str]:
     if not match:
         return None
     return match.group(1).strip()
+
+
+def _normalize_command_signature(command: str) -> str:
+    return " ".join(command.split())
+
+
+def _record_command_signature(recent: List[str], signature: str) -> None:
+    recent.append(signature)
+    if len(recent) > COMMAND_LOOP_SIG_WINDOW:
+        del recent[: len(recent) - COMMAND_LOOP_SIG_WINDOW]
+
+
+def _command_stuck_in_loop(recent: List[str]) -> bool:
+    if len(recent) < COMMAND_LOOP_THRESHOLD:
+        return False
+    tail = recent[-COMMAND_LOOP_THRESHOLD:]
+    return len(set(tail)) == 1
 
 
 # -----------------------------
@@ -1529,6 +1551,17 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     recent_examples = _recent_commit_examples(repo)
     if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
         parts.append(recent_examples)
+
+    likely_tests = _discover_likely_test_nodes(repo, issue, tracked_set)
+    if likely_tests:
+        test_lines = [
+            "### Likely relevant tests (issue-keyword ranked — run with `path::test_name` when possible)\n"
+        ]
+        for node_id, body in likely_tests:
+            test_lines.append(f"#### `{node_id}`\n```python\n{_truncate(body, 1200)}\n```")
+        test_block = "\n\n".join(test_lines)
+        if used + len(test_block) <= MAX_PRELOADED_CONTEXT_CHARS + 2500:
+            parts.append(test_block)
 
     return "\n\n".join(parts), included
 
@@ -2486,10 +2519,251 @@ def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
     return augmented
 
 
+# -----------------------------
+# Pytest helpers (output compression + targeted command suggestions)
+# -----------------------------
+
+def _build_pytest_bash(
+    repo: Path,
+    *,
+    file_paths: Optional[List[str]] = None,
+    node_ids: Optional[List[str]] = None,
+) -> Optional[str]:
+    """Return a repo-local pytest command for the given file or node targets."""
+    targets: List[str] = []
+    if node_ids:
+        targets.extend(node_ids)
+    elif file_paths:
+        targets.extend(file_paths)
+    if not targets:
+        return None
+    quoted = " ".join(f"'{t}'" for t in targets)
+    if _has_executable("pytest"):
+        return f"pytest {quoted} -x -q --tb=short --no-header"
+    return f"python3 -m pytest {quoted} -x -q --tb=short --no-header"
+
+
+def _extract_failed_test_names(pytest_output: str) -> List[str]:
+    """Extract FAILED/ERROR node ids from pytest short summary."""
+    failed: List[str] = []
+    seen: set = set()
+    pattern = re.compile(r"^(FAILED|ERROR)\s+([^-]+?)\s*-")
+    for line in pytest_output.splitlines():
+        if "skipped" in line.lower():
+            continue
+        match = pattern.match(line.strip())
+        if match:
+            name = match.group(2).strip()
+            if name not in seen:
+                seen.add(name)
+                failed.append(name)
+    return failed
+
+
+def _compress_pytest_observation(raw: str) -> str:
+    """Compress verbose pytest output to failures + short summary."""
+    if not raw.strip():
+        return raw
+    lower = raw.lower()
+    if "successfully ran all tests" in lower or (
+        " passed" in lower and " failed" not in lower and " error" not in lower
+    ):
+        tail = raw[-800:] if len(raw) > 800 else raw
+        return "PYTEST: all tests passed.\n" + tail
+
+    parts: List[str] = []
+    summary_match = re.search(
+        r"={5,}\s*short test summary info\s*={5,}(.*?)(?:={5,}|$)",
+        raw,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if summary_match:
+        summary = summary_match.group(1).strip()
+        if summary:
+            parts.append("short test summary:\n" + _truncate(summary, 4000))
+
+    failures_match = re.search(
+        r"={5,}\s*FAILURES\s*={5,}(.*?)(?:={5,}\s*short test summary|$)",
+        raw,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if failures_match:
+        parts.append("failures:\n" + _truncate(failures_match.group(1).strip(), 6000))
+    elif _extract_failed_test_names(raw):
+        parts.append("failed: " + ", ".join(_extract_failed_test_names(raw)[:8]))
+
+    if not parts:
+        return _truncate(raw, MAX_OBSERVATION_CHARS)
+    return "\n\n".join(parts)
+
+
+def _extract_issue_keywords(issue_text: str) -> List[str]:
+    """Issue tokens for test-function matching."""
+    quoted = re.findall(r'"[^"\n]*"|\'[^\'\n]*\'', issue_text)
+    module_paths = re.findall(r"\b(?:\w+\.){2,}\w+\b", issue_text)
+    raw_tokens = re.findall(r"\b\w+\b", issue_text, flags=re.UNICODE)
+    special = [c for c in issue_text if not c.isspace() and ord(c) > 127]
+    stop = {
+        "the", "and", "for", "with", "that", "this", "from", "when", "should",
+        "must", "issue", "test", "tests", "fix", "bug", "error",
+    }
+    tokens = [
+        t.strip("\"'").lower()
+        for t in (quoted + module_paths + raw_tokens + special)
+        if len(t.strip("\"'")) >= 3 and t.lower() not in stop
+    ]
+    seen: set = set()
+    out: List[str] = []
+    for t in tokens:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+        if len(out) >= 10:
+            break
+    return out
+
+
+def _get_python_function_body(repo: Path, relative_path: str, function_name: str) -> str:
+    import ast
+
+    full = repo / relative_path
+    try:
+        content = full.read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(content, filename=str(full))
+    except Exception:
+        return ""
+
+    class_name = None
+    func_only = function_name
+    if "::" in function_name:
+        class_name, func_only = function_name.split("::", 1)
+
+    target_node = None
+    if class_name:
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef) or node.name != class_name:
+                continue
+            for child in node.body:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name == func_only:
+                    target_node = child
+                    break
+            if target_node is not None:
+                break
+    else:
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == func_only:
+                target_node = node
+                break
+
+    if target_node is None:
+        return ""
+
+    if hasattr(ast, "get_source_segment"):
+        seg = ast.get_source_segment(content, target_node)
+        if seg:
+            return seg
+    start = target_node.lineno
+    if getattr(target_node, "decorator_list", None):
+        start = target_node.decorator_list[0].lineno
+    end = getattr(target_node, "end_lineno", None) or start
+    lines = content.splitlines()
+    return "\n".join(lines[start - 1 : end])
+
+
+def _discover_likely_test_nodes(
+    repo: Path, issue_text: str, tracked: Optional[set] = None, max_hits: int = 4
+) -> List[Tuple[str, str]]:
+    """Rank test functions by issue-keyword overlap; return (node_id, body) pairs."""
+    import ast
+
+    if tracked is None:
+        tracked = set(_tracked_files(repo))
+    keywords = _extract_issue_keywords(issue_text)
+    if not keywords:
+        keywords = _issue_terms(issue_text)[:6]
+
+    scored: List[Tuple[int, str, str]] = []
+    test_files = [
+        p for p in tracked
+        if p.endswith(".py") and ("test" in Path(p).name.lower() or "/test" in p.lower())
+    ]
+
+    for relative_path in test_files[:40]:
+        full = repo / relative_path
+        try:
+            content = full.read_text(encoding="utf-8", errors="replace")
+            tree = ast.parse(content, filename=str(relative_path))
+        except Exception:
+            continue
+
+        def _score_name(name: str) -> int:
+            nl = name.lower()
+            return sum(2 for kw in keywords if kw in nl)
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                for child in node.body:
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name.startswith("test_"):
+                        score = _score_name(child.name)
+                        if score <= 0:
+                            continue
+                        node_id = f"{relative_path}::{child.name}"
+                        body = _get_python_function_body(repo, relative_path, child.name)
+                        if body:
+                            scored.append((score, node_id, body))
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
+                score = _score_name(node.name)
+                if score <= 0:
+                    continue
+                node_id = f"{relative_path}::{node.name}"
+                body = _get_python_function_body(repo, relative_path, node.name)
+                if body:
+                    scored.append((score, node_id, body))
+
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    out: List[Tuple[str, str]] = []
+    seen: set = set()
+    for _score, node_id, body in scored:
+        if node_id in seen:
+            continue
+        seen.add(node_id)
+        out.append((node_id, body))
+        if len(out) >= max_hits:
+            break
+    return out
+
+
+def _format_action_observation(result: CommandResult, command: str = "") -> str:
+    """Like format_observation but compress pytest noise when applicable."""
+    if _looks_like_verification_command(command) and "pytest" in command.lower():
+        raw = (result.stdout or "") + "\n" + (result.stderr or "")
+        compressed = _compress_pytest_observation(raw)
+        if compressed and compressed != raw:
+            parts = [
+                "COMMAND:",
+                result.command,
+                "",
+                "EXIT_CODE:",
+                str(result.exit_code),
+                "",
+                "DURATION_SECONDS:",
+                f"{result.duration_sec:.3f}",
+                "",
+                "PYTEST_SUMMARY:",
+                _truncate(compressed, MAX_OBSERVATION_CHARS),
+            ]
+            if result.stderr.strip() and result.exit_code != 0:
+                parts.extend(["", "STDERR_TAIL:", _truncate(result.stderr, 2000)])
+            return "\n".join(parts) + "\n"
+    return format_observation(result)
+
+
 def _run_companion_test(
     repo: Path,
     test_path: str,
     timeout_seconds: int = 8,
+    *,
+    node_id: Optional[str] = None,
 ) -> Optional[str]:
     """Best-effort companion-test execution. Returns failure-output tail on FAIL,
     or None when the test passed, the runner is unavailable, or the language
@@ -2524,12 +2798,12 @@ def _run_companion_test(
 
     # ---- Python ----
     if suffix == ".py":
+        target = node_id or test_path
+        args: List[str] = ["-x", "--tb=short", "-q", "--no-header", target]
         runner_cmds: List[List[str]] = []
         if _has_executable("pytest"):
-            runner_cmds.append(["pytest", "-x", "--tb=short", "-q", "--no-header", test_path])
-        # Always also try `python3 -m pytest`: works when pytest is importable
-        # but no `pytest` binary is on PATH (pip-installed without entry script).
-        runner_cmds.append(["python3", "-m", "pytest", "-x", "--tb=short", "-q", "--no-header", test_path])
+            runner_cmds.append(["pytest"] + args)
+        runner_cmds.append(["python3", "-m", "pytest"] + args)
 
         for cmd in runner_cmds:
             try:
@@ -2543,7 +2817,7 @@ def _run_companion_test(
                     env=_command_env(),
                 )
             except subprocess.TimeoutExpired:
-                return f"Companion test `{test_path}` timed out after {timeout_seconds}s."
+                return f"Companion test `{target}` timed out after {timeout_seconds}s."
             except Exception:
                 continue
 
@@ -2555,12 +2829,14 @@ def _run_companion_test(
                 "/usr/bin/env: python3",
             )
             if any(marker in output for marker in unrunnable_markers):
-                continue  # try next runner / give up if all fail
+                continue
             if proc.returncode == 0:
-                return None  # test passed
-            return output[-2400:] if len(output) > 2400 else output
+                return None
+            compressed = _compress_pytest_observation(output)
+            tail = compressed if compressed else output
+            return tail[-2400:] if len(tail) > 2400 else tail
 
-        return None  # no runner produced a usable signal
+        return None
 
     # ---- JS / TS ----
     if suffix in {".ts", ".tsx", ".js", ".jsx", ".cjs", ".mjs"}:
@@ -2659,13 +2935,27 @@ def _select_companion_test_failure(
     repo: Path,
     patch: str,
     test_timeout_seconds: int = 8,
+    *,
+    failed_node_ids: Optional[List[str]] = None,
 ) -> Optional[Tuple[str, str]]:
     """For files touched by the patch, find the first companion test that fails.
 
     Returns (test_path, output_tail) on the first non-None failure, else None.
-    Stops at the first failure to keep the refinement budget tight (one fix
-    turn maximum per cycle).
+    Re-runs node ids only when the model already surfaced pytest failures this
+    cycle; otherwise falls back to edited-file test partners like the king.
     """
+    if failed_node_ids:
+        for node_id in failed_node_ids[:4]:
+            file_part = node_id.split("::", 1)[0]
+            output = _run_companion_test(
+                repo,
+                file_part,
+                timeout_seconds=test_timeout_seconds,
+                node_id=node_id,
+            )
+            if output:
+                return (node_id, output)
+
     edited = _patch_changed_files(patch)
     if not edited:
         return None
@@ -2676,7 +2966,11 @@ def _select_companion_test_failure(
         partner = _find_test_partner(relative_path, tracked)
         if not partner:
             continue
-        output = _run_companion_test(repo, partner, timeout_seconds=test_timeout_seconds)
+        output = _run_companion_test(
+            repo,
+            partner,
+            timeout_seconds=test_timeout_seconds,
+        )
         if output:
             return (partner, output)
     return None
@@ -2689,8 +2983,27 @@ def _companion_test_timeout_seconds(command_timeout: int, remaining_seconds: flo
     return int(min(max(8, command_timeout // 2), 14, max(8, remaining_seconds // 6)))
 
 
-def _suggest_targeted_test_command(repo: Path, patch: str) -> Optional[str]:
+def _suggest_targeted_test_command(
+    repo: Path,
+    patch: str,
+    *,
+    known_node_ids: Optional[List[str]] = None,
+    failed_node_ids: Optional[List[str]] = None,
+) -> Optional[str]:
     """Return a single repo-local verification command for edited companion tests."""
+    if failed_node_ids:
+        node = failed_node_ids[0]
+        if node.endswith(".py") or "::" in node:
+            cmd = _build_pytest_bash(repo, node_ids=[node])
+            if cmd:
+                return cmd
+
+    if known_node_ids:
+        node = known_node_ids[0]
+        cmd = _build_pytest_bash(repo, node_ids=[node])
+        if cmd:
+            return cmd
+
     edited = _patch_changed_files(patch)
     if not edited:
         return None
@@ -2701,7 +3014,10 @@ def _suggest_targeted_test_command(repo: Path, patch: str) -> Optional[str]:
             continue
         suffix = Path(partner).suffix.lower()
         if suffix == ".py":
-            return f"pytest {partner} -x -q --tb=short"
+            cmd = _build_pytest_bash(repo, file_paths=[partner])
+            if cmd:
+                return cmd
+            return f"python3 -m pytest '{partner}' -x -q --tb=short --no-header"
         if suffix in {".ts", ".tsx", ".js", ".jsx"}:
             return f"npm test -- {partner}"
         if suffix == ".go":
@@ -3840,8 +4156,10 @@ def _strip_preloaded_section(
     return _PRELOAD_BLOCK_RE.sub(replacement, initial_user_text, count=1)
 
 
-def build_no_command_repair_prompt() -> str:
-    return """Your previous response did not contain a valid <command>...</command>, <edit>...</edit>, or <final>...</final> block.
+def build_format_repair_prompt(strike: int) -> str:
+    """Tiered format repair after missing action blocks."""
+    if strike <= 1:
+        return """Your previous response did not contain a valid <command>...</command>, <edit>...</edit>, or <final>...</final> block.
 
 If the patch is complete, respond with <final>summary</final>. Otherwise continue with exactly one action:
 
@@ -3856,6 +4174,45 @@ or:
 your bash command here
 </command>
 """
+    return (
+        f"[Format reminder #{strike}] Repeated format failures ({strike}/{MAX_NO_COMMAND_REPAIRS}). "
+        "Respond with ONLY ONE of:\n"
+        "- one `<edit>` block, OR\n"
+        "- one <command>...</command>, OR\n"
+        "- <final>...</final> if done.\n\n"
+        "Example `<edit>`:\n"
+        '<edit path="src/foo.py" op="replace">\n'
+        "<old>    return True</old>\n"
+        "<new>    return False</new>\n"
+        "</edit>"
+    )
+
+
+def build_command_loop_nudge(has_patch: bool) -> str:
+    if has_patch:
+        return (
+            f"WARNING: You ran the same bash command {COMMAND_LOOP_THRESHOLD} times in a row. "
+            "Stop repeating it. If the patch is incomplete, use `<edit>` for a precise edit "
+            "or try a different verification command. If done, emit <final>."
+        )
+    return (
+        f"WARNING: You ran the same bash command {COMMAND_LOOP_THRESHOLD} times in a row without "
+        "a patch on disk. Stop exploring the same path — use `<edit>` on the most likely file "
+        "from the issue/preload, or one different focused grep/sed command."
+    )
+
+
+def build_consecutive_cmd_failure_nudge() -> str:
+    return (
+        f"WARNING: Your last {CONSECUTIVE_CMD_FAILURE_THRESHOLD} actions failed (non-zero exit). "
+        "Read STDERR carefully. Do NOT repeat the same command unchanged. "
+        "Prefer `<edit>` with more surrounding OLD context, or inspect the file with `sed -n` "
+        "before editing."
+    )
+
+
+def build_no_command_repair_prompt() -> str:
+    return build_format_repair_prompt(1)
 
 
 def build_budget_pressure_prompt(step: int) -> str:
@@ -4834,6 +5191,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     ship_blocker_nudges_used = 0
     verification_nudges_used = 0
     last_verification_step = 0
+    known_test_node_ids: List[str] = []
+    last_failed_test_names: List[str] = []
+    recent_command_sigs: List[str] = []
+    consecutive_command_failures = 0
     solve_started_at = time.monotonic()
 
     def time_remaining() -> float:
@@ -4978,6 +5339,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 test_timeout_seconds=_companion_test_timeout_seconds(
                     command_timeout, time_remaining()
                 ),
+                failed_node_ids=last_failed_test_names,
             )
             if failure is not None:
                 test_path, output = failure
@@ -5129,6 +5491,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         repo_summary = get_repo_summary(repo)
         preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
         _tracked_set_for_checks: set = set(_tracked_files(repo))
+        known_test_node_ids = [n for n, _ in _discover_likely_test_nodes(repo, issue, _tracked_set_for_checks)]
+        logs.append(f"RANKED_TEST_NODES: count={len(known_test_node_ids)}")
 
         _initial_user_content = (
             (prior_attempt_summary if prior_attempt_summary else "")
@@ -5259,7 +5623,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             logs.append("MODEL_RESPONSE:\n" + response_text)
 
             actions = extract_actions_in_order(response_text)
-            commands = [v for k, v in actions if k == "command"]
             final = extract_final(response_text)
 
             if not actions:
@@ -5286,34 +5649,82 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     logs.append("\nSTOPPED:\nModel repeatedly failed to produce a command or final answer.")
                     break
                 messages.append({"role": "assistant", "content": response_text})
-                messages.append({"role": "user", "content": build_no_command_repair_prompt()})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": build_format_repair_prompt(consecutive_no_command),
+                    }
+                )
                 continue
 
             consecutive_no_command = 0
             messages.append({"role": "assistant", "content": response_text})
             observations: List[str] = []
             action_batch = actions[:MAX_COMMANDS_PER_RESPONSE]
-            command_batch = [v for k, v in action_batch if k == "command"]  # kept for downstream compat
+            command_loop_nudged = False
+
+            def _note_action_failure(exit_code: int) -> None:
+                nonlocal consecutive_command_failures
+                if exit_code != 0:
+                    consecutive_command_failures += 1
+                    if consecutive_command_failures >= CONSECUTIVE_CMD_FAILURE_THRESHOLD:
+                        observations.append(
+                            "SYSTEM:\n" + build_consecutive_cmd_failure_nudge()
+                        )
+                        logs.append(
+                            f"\nCONSECUTIVE_CMD_FAILURE_NUDGE: streak={consecutive_command_failures}\n"
+                        )
+                else:
+                    consecutive_command_failures = 0
+
+            def _note_pytest_output(command: str, result: CommandResult) -> None:
+                nonlocal last_failed_test_names
+                if (
+                    _looks_like_verification_command(command)
+                    and "pytest" in command.lower()
+                    and result.exit_code != 0
+                ):
+                    raw = (result.stdout or "") + "\n" + (result.stderr or "")
+                    failed = _extract_failed_test_names(raw)
+                    if failed:
+                        last_failed_test_names = failed
 
             for command_index, (kind, value) in enumerate(action_batch, 1):
                 if kind == "edit":
                     result = execute_edit(value, repo)
                     command = result.command
+                    _note_action_failure(result.exit_code)
                 else:
                     command = value
+                    sig = _normalize_command_signature(command)
+                    _record_command_signature(recent_command_sigs, sig)
+                    if not command_loop_nudged and _command_stuck_in_loop(recent_command_sigs):
+                        command_loop_nudged = True
+                        _loop_patch = bool(get_patch(repo).strip())
+                        observations.append("SYSTEM:\n" + build_command_loop_nudge(_loop_patch))
+                        logs.append(
+                            f"\nCOMMAND_LOOP_NUDGE: same_sig_x{COMMAND_LOOP_THRESHOLD} "
+                            f"has_patch={_loop_patch}\n"
+                        )
                     if _looks_like_verification_command(command):
                         last_verification_step = step
                     result = run_command(command, repo, timeout=command_timeout)
-                observation = format_observation(result)
+                    _note_action_failure(result.exit_code)
+                    _note_pytest_output(command, result)
+                observation = _format_action_observation(
+                    result, command if kind == "command" else ""
+                )
 
-                observations.append(f"OBSERVATION {command_index}/{len(action_batch)}:\n{observation}")
+                observations.append(
+                    f"OBSERVATION {command_index}/{len(action_batch)}:\n{observation}"
+                )
                 logs.append(f"\nOBSERVATION {command_index}/{len(action_batch)}:\n" + observation)
 
-                if step >= 4 or command_index > 1:
+                if step >= 4 or command_index > 1 or kind == "edit":
                     patch = get_patch(repo)
                     if patch.strip() and _looks_like_successful_test_output(observation, command):
                         if maybe_queue_refinement(response_text):
-                            break  # refinement queued — re-enter outer loop next iteration
+                            break
                         if (
                             test_fix_turns_used < MAX_TEST_FIX_TURNS
                             and total_refinement_turns_used < MAX_TOTAL_REFINEMENT_TURNS
@@ -5323,7 +5734,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                                 command_timeout, time_remaining()
                             )
                             failure = _select_companion_test_failure(
-                                repo, patch, test_timeout_seconds=_ct_timeout
+                                repo,
+                                patch,
+                                test_timeout_seconds=_ct_timeout,
+                                failed_node_ids=last_failed_test_names,
                             )
                             if failure is not None:
                                 test_path, output = failure
@@ -5348,7 +5762,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                         break
                     if patch.strip() and step >= 8 and _looks_like_patch_review_command(command, result):
                         if not _patch_covers_required_paths(patch, issue):
-                            # Required path not yet touched — keep working instead of accepting.
                             continue
                         if maybe_queue_refinement(response_text):
                             break
@@ -5380,7 +5793,12 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             if observations:
                 observation_text = "\n\n".join(observations)
                 if not success and get_patch(repo).strip():
-                    _verify_hint = _suggest_targeted_test_command(repo, get_patch(repo))
+                    _verify_hint = _suggest_targeted_test_command(
+                        repo,
+                        get_patch(repo),
+                        known_node_ids=known_test_node_ids,
+                        failed_node_ids=last_failed_test_names,
+                    )
                     _verify_line = (
                         f"Suggested targeted verification: `{_verify_hint}`\n"
                         if _verify_hint
@@ -5411,7 +5829,12 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 and last_verification_step < step - 2
                 and time_remaining() >= _REFINEMENT_TIME_FLOOR_SECONDS
             ):
-                _late_verify = _suggest_targeted_test_command(repo, get_patch(repo))
+                _late_verify = _suggest_targeted_test_command(
+                    repo,
+                    get_patch(repo),
+                    known_node_ids=known_test_node_ids,
+                    failed_node_ids=last_failed_test_names,
+                )
                 if _late_verify:
                     verification_nudges_used += 1
                     messages.append(
