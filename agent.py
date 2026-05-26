@@ -132,6 +132,7 @@ MAX_POLISH_TURNS = 1       # strip whitespace/comment/blank-only hunks
 MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope creep
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
+MAX_BASELINE_VERIFY_TURNS = 1  # re-run originally-failing tests on patched repo; fix any still-failing
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_FINAL_CHECKLIST_NUDGES = 1  # one mandatory pre-final per-requirement verification pass
@@ -1550,7 +1551,7 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     # v21 edge: append recent-commit examples as concrete style anchors. Silent
     # no-op when the repo has no real history (pilot snapshots have one
     # synthetic commit) — the helper returns "" and we add nothing.
-    recent_examples = _recent_commit_examples(repo)
+    recent_examples = _recent_commit_examples(repo, issue)
     if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
         parts.append(recent_examples)
 
@@ -1573,6 +1574,34 @@ _BACKTICK_PATH_HITS_MAX = 5  # generic identifiers (basic.py, util) often match
                               # dozens of unrelated files — only treat as
                               # "mentioned" when an identifier picks out a
                               # specific small handful in the tracked set.
+
+
+def _term_idf_weights(terms: List[str], tracked: List[str]) -> Dict[str, float]:
+    """IDF over filename tokens. Rare terms (OAuthCallbackHandler) get higher
+    weight than common ones (data, util). Smoothed with +1; capped at 5x.
+
+    Stdlib only — math is the only import needed and we import locally to keep
+    this self-contained. Document-frequency is computed case-insensitively
+    against lowercased filename tokens, and the result is keyed by the
+    ORIGINAL term so callers can look it up without normalizing first.
+    """
+    if not terms or not tracked:
+        return {}
+    import math
+    name_tokens: List[set] = []
+    for p in tracked:
+        toks = set(re.findall(r"[a-z0-9]+", p.lower()))
+        name_tokens.append(toks)
+    n = len(name_tokens)
+    out: Dict[str, float] = {}
+    for t in terms:
+        t_low = t.lower()
+        df = 0
+        for toks in name_tokens:
+            if any(t_low in tok for tok in toks):
+                df += 1
+        out[t] = min(5.0, math.log((n + 1) / (df + 1)) + 1.0)
+    return out
 
 
 def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
@@ -1614,6 +1643,8 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
     id_boost = _issue_identifier_path_boost(issue, list(tracked_set))
     err_boost = _issue_error_string_boost(repo, tracked_set, issue)
+    # Rare-term boost: OAuthCallbackHandler should outweigh generic "data".
+    idf_weights = _term_idf_weights(terms, tracked)
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -1630,9 +1661,9 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
             score += 24
         if stem_lower and len(stem_lower) >= 3 and stem_lower in issue_lower:
             score += 16
-        score += sum(3 for term in terms if term in path_lower)
+        score += sum(int(3 * idf_weights.get(term, 1.0)) for term in terms if term in path_lower)
         if "/test" in path_lower or "spec." in path_lower or ".test." in path_lower:
-            score += sum(2 for term in terms if term in path_lower)
+            score += sum(int(2 * idf_weights.get(term, 1.0)) for term in terms if term in path_lower)
         # Boost files whose contents reference identifiers from the issue.
         if relative_path in symbol_hits:
             score += 60 + min(40, 8 * symbol_hits[relative_path])
@@ -2395,12 +2426,161 @@ def _check_brace_balance_one(repo: Path, relative_path: str) -> Optional[str]:
     return None
 
 
+def _check_go_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Best-effort Go syntax check via `gofmt -e`. Returns error summary on
+    parse failure, None on success or when gofmt is unavailable.
+
+    Only structural parse errors are reported — type / dependency / import
+    errors require a full module build that often fails in sandboxes for
+    reasons unrelated to the patch.
+    """
+    if not _has_executable("gofmt"):
+        return None
+    full = repo / relative_path
+    if not full.exists() or not full.is_file():
+        return None
+    try:
+        proc = subprocess.run(
+            ["gofmt", "-e", str(full)],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=8,
+        )
+    except Exception:
+        return None
+    if proc.returncode == 0:
+        return None
+    err = (proc.stderr or "").strip()
+    if not err:
+        return None
+    lines = [ln.strip() for ln in err.splitlines() if ln.strip()][:3]
+    return f"{relative_path}: go syntax error: " + " | ".join(lines)[:400]
+
+
+def _check_rust_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Best-effort Rust syntax check via `rustc -Zparse-only` (nightly) or
+    `rustc --emit=metadata --crate-type=lib` (stable). Returns None when
+    rustc is unavailable or the file can't be parsed in isolation (the
+    common case — most Rust files depend on sibling modules).
+
+    Reports only real parse-shaped failures; skips type/unresolved-name
+    errors which are dependency artifacts rather than syntax bugs.
+    """
+    if not _has_executable("rustc"):
+        return None
+    full = repo / relative_path
+    if not full.exists() or not full.is_file():
+        return None
+    # Try nightly's parse-only mode first, then fall back to a metadata-only
+    # compile that at least exercises the parser. Either may fail for reasons
+    # unrelated to syntax (missing crates), so the output is post-filtered.
+    cmds = (
+        ["rustc", "--edition=2021", "-Zparse-only", "--crate-type=lib", str(full)],
+        ["rustc", "--edition=2021", "--emit=metadata", "--crate-type=lib", "-o", "/dev/null", str(full)],
+    )
+    err = ""
+    for cmd in cmds:
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10,
+            )
+        except Exception:
+            continue
+        if proc.returncode == 0:
+            return None
+        err = (proc.stderr or "").strip()
+        if err:
+            break
+    if not err:
+        return None
+    syntax_markers = ("expected", "unexpected", "syntax error", "mismatched", "unclosed", "expected one of")
+    skip_markers = ("cannot find", "unresolved import", "no such file", "can't find crate", "file not found for module")
+    relevant: List[str] = []
+    for line in err.splitlines():
+        low = line.lower()
+        if any(s in low for s in skip_markers):
+            continue
+        if any(s in low for s in syntax_markers):
+            relevant.append(line.strip())
+    if not relevant:
+        return None
+    return f"{relative_path}: rust syntax error: " + " | ".join(relevant[:3])[:400]
+
+
+def _check_cpp_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Best-effort C/C++ syntax check via `g++ -fsyntax-only` or `clang++ -fsyntax-only`.
+
+    Only structural parse errors are reported. Header-not-found / undeclared-
+    identifier / type-mismatch errors are filtered out because they typically
+    reflect dependency issues the sandbox can't resolve, not bugs in the
+    patch itself. Empirical loss data from production duels shows multiple
+    challengers were defeated by trivial parse errors that this gate would
+    catch (e.g. `#else` instead of `else`, broken `#include "x.hpp"` quoting).
+    """
+    compiler = "g++" if _has_executable("g++") else ("clang++" if _has_executable("clang++") else None)
+    if not compiler:
+        return None
+    full = repo / relative_path
+    if not full.exists() or not full.is_file():
+        return None
+    suffix = Path(relative_path).suffix.lower()
+    # For C-only files prefer gcc/clang; for C++ headers/sources keep g++/clang++.
+    if suffix in {".c", ".h"}:
+        compiler = "gcc" if _has_executable("gcc") else ("clang" if _has_executable("clang") else compiler)
+    std_flag = "-std=c++17" if suffix in {".cc", ".cpp", ".cxx", ".hpp"} else "-std=c11"
+    try:
+        proc = subprocess.run(
+            [compiler, "-fsyntax-only", std_flag, "-Wno-everything", str(full)],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return None
+    if proc.returncode == 0:
+        return None
+    err = (proc.stderr or "").strip()
+    if not err:
+        return None
+    # Skip header-resolution errors that reflect sandbox limits, not syntax bugs.
+    skip_markers = (
+        "fatal error: ", "file not found", "no such file or directory",
+        "cannot find -l", "undefined reference to",
+        "use of undeclared identifier", "no member named",
+        "no type named", "implicit declaration of function",
+    )
+    syntax_markers = (
+        "expected", "unexpected", "stray ",
+        "missing terminating", "unterminated",
+        "expected ';'", "expected '}'", "expected ')'",
+        "extraneous closing", "extra tokens",
+    )
+    relevant: List[str] = []
+    for line in err.splitlines():
+        low = line.lower()
+        if any(s in low for s in skip_markers):
+            continue
+        if any(s in low for s in syntax_markers) or "error:" in low and "expected" in low:
+            relevant.append(line.strip())
+    if not relevant:
+        return None
+    return f"{relative_path}: C/C++ syntax error: " + " | ".join(relevant[:3])[:400]
+
+
 def _check_syntax(repo: Path, patch: str) -> List[str]:
     """Best-effort multi-language syntax check on touched files.
 
     Returns a flat list of error strings. An empty list means every file we
-    know how to check parsed; languages we can't check (Go, Rust, etc.) are
-    silently passed through.
+    know how to check parsed; languages we can't check are silently passed.
     """
     errors: List[str] = []
     for relative_path in _patch_changed_files(patch):
@@ -2415,6 +2595,12 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
                 result = _check_brace_balance_one(repo, relative_path)
         elif suffix in {".json"}:
             result = _check_json_syntax_one(repo, relative_path)
+        elif suffix == ".go":
+            result = _check_go_syntax_one(repo, relative_path)
+        elif suffix == ".rs":
+            result = _check_rust_syntax_one(repo, relative_path)
+        elif suffix in {".cc", ".cpp", ".cxx", ".c", ".h", ".hpp"}:
+            result = _check_cpp_syntax_one(repo, relative_path)
         elif suffix in _BRACE_BALANCE_SUFFIXES:
             result = _check_brace_balance_one(repo, relative_path)
         # Other suffixes: trust the model; the LLM judge catches gross errors.
@@ -2464,22 +2650,35 @@ _TEST_PARTNER_TEMPLATES: Tuple[Tuple[str, str], ...] = (
     ("{stem}.py", "test/{stem}_test.py"),
     ("{stem}.py", "test/test_{stem}.py"),
     ("{stem}.py", "{dir}/{stem}_test.py"),
-    # TypeScript / JavaScript — Jest / Vitest conventions.
+    # TypeScript / JavaScript — Jest / Vitest conventions (.test.* and .spec.*).
     ("{stem}.ts", "{dir}/{stem}.test.ts"),
+    ("{stem}.ts", "{dir}/{stem}.spec.ts"),
     ("{stem}.ts", "{dir}/__tests__/{stem}.test.ts"),
+    ("{stem}.ts", "{dir}/__tests__/{stem}.spec.ts"),
     ("{stem}.ts", "tests/{stem}.test.ts"),
+    ("{stem}.ts", "tests/{stem}.spec.ts"),
     ("{stem}.ts", "test/{stem}.test.ts"),
     ("{stem}.tsx", "{dir}/{stem}.test.tsx"),
+    ("{stem}.tsx", "{dir}/{stem}.spec.tsx"),
     ("{stem}.tsx", "{dir}/__tests__/{stem}.test.tsx"),
     ("{stem}.js", "{dir}/{stem}.test.js"),
+    ("{stem}.js", "{dir}/{stem}.spec.js"),
     ("{stem}.js", "{dir}/__tests__/{stem}.test.js"),
     ("{stem}.js", "tests/{stem}.test.js"),
+    ("{stem}.js", "tests/{stem}.spec.js"),
     ("{stem}.js", "test/{stem}.test.js"),
     ("{stem}.jsx", "{dir}/{stem}.test.jsx"),
-    # Other languages — single canonical convention each.
+    ("{stem}.jsx", "{dir}/{stem}.spec.jsx"),
+    # Go.
     ("{stem}.go", "{dir}/{stem}_test.go"),
+    # Rust — inline _test.rs and the `tests/{stem}.rs` integration convention.
     ("{stem}.rs", "{dir}/{stem}_test.rs"),
+    ("{stem}.rs", "tests/{stem}.rs"),
+    # Ruby — rspec convention and minitest fallback.
     ("{stem}.rb", "spec/{stem}_spec.rb"),
+    ("{stem}.rb", "test/{stem}_test.rb"),
+    # PHP — PSR-4 / phpunit convention.
+    ("{stem}.php", "tests/{stem}Test.php"),
 )
 
 
@@ -2672,10 +2871,79 @@ def _get_python_function_body(repo: Path, relative_path: str, function_name: str
     return "\n".join(lines[start - 1 : end])
 
 
+_GO_TEST_FUNC_RE = re.compile(r"^func\s+(Test[A-Z][A-Za-z0-9_]*)\s*\(", re.MULTILINE)
+_JS_TEST_BLOCK_RE = re.compile(
+    r"""(?:^|\s)(?:it|test)\s*\(\s*['"`]([^'"`\n]{3,120})['"`]""",
+    re.MULTILINE,
+)
+_RUST_TEST_FUNC_RE = re.compile(
+    r"#\[(?:test|tokio::test|async_std::test)\]\s*(?:#\[[^\]]+\]\s*)*(?:pub\s+)?(?:async\s+)?fn\s+([a-z_][a-z0-9_]*)\s*\(",
+    re.MULTILINE,
+)
+# PHP: phpunit-style `public function testX()` methods or files with `@test`
+# annotations on top of regular methods.
+_PHP_TEST_FUNC_RE = re.compile(
+    r"(?:^|\s)public\s+function\s+(test[A-Za-z0-9_]+)\s*\(",
+    re.MULTILINE,
+)
+_PHP_ANNOTATED_TEST_RE = re.compile(
+    r"@test\s*\*?\s*\*/\s*public\s+function\s+([A-Za-z_][A-Za-z0-9_]+)\s*\(",
+    re.MULTILINE | re.DOTALL,
+)
+# Ruby: rspec `it 'title'` / `describe 'group'` blocks AND minitest `def test_x` methods.
+_RUBY_RSPEC_RE = re.compile(
+    r"""(?:^|\s)(?:it|specify|scenario)\s*['"]([^'"\n]{3,120})['"]""",
+    re.MULTILINE,
+)
+_RUBY_MINITEST_RE = re.compile(
+    r"^\s*def\s+(test_[a-z_][a-z0-9_]*)\s*(?:\(|$)",
+    re.MULTILINE,
+)
+# Java: JUnit-style `@Test` annotation followed by `public void methodName()`.
+# Captures both JUnit 4 (org.junit.Test) and JUnit 5 (org.junit.jupiter.api.Test).
+_JAVA_TEST_FUNC_RE = re.compile(
+    r"@Test(?:\([^)]*\))?\s+(?:@\w+(?:\([^)]*\))?\s+)*public\s+(?:final\s+)?void\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(",
+    re.MULTILINE | re.DOTALL,
+)
+# Kotlin: JUnit `@Test`/`@kotlin.test.Test` annotation followed by `fun name()`.
+_KOTLIN_TEST_FUNC_RE = re.compile(
+    r"@(?:Test|kotlin\.test\.Test)(?:\([^)]*\))?\s+(?:@\w+(?:\([^)]*\))?\s+)*(?:public\s+|internal\s+|private\s+)?fun\s+`?([a-zA-Z_][a-zA-Z0-9_` ]{2,80})`?\s*\(",
+    re.MULTILINE | re.DOTALL,
+)
+# Swift / XCTest: `func testXxx()` methods (optionally async / throws).
+_SWIFT_TEST_FUNC_RE = re.compile(
+    r"\bfunc\s+(test[A-Z][A-Za-z0-9_]*)\s*\(\s*\)",
+    re.MULTILINE,
+)
+# C/C++ GoogleTest: `TEST(SuiteName, TestName)` / `TEST_F(...)` / `TEST_P(...)`.
+_CPP_GTEST_RE = re.compile(
+    r"\bTEST(?:_F|_P)?\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)",
+    re.MULTILINE,
+)
+
+
 def _discover_likely_test_nodes(
     repo: Path, issue_text: str, tracked: Optional[set] = None, max_hits: int = 4
 ) -> List[Tuple[str, str]]:
-    """Rank test functions by issue-keyword overlap; return (node_id, body) pairs."""
+    """Rank test functions by issue-keyword overlap; return (node_id, body) pairs.
+
+    Supports four languages:
+      - Python (.py): pytest functions / methods starting with `test_`.
+        node_id = "path::test_name", body = function source.
+      - Go (*_test.go): functions matching `func Test*`.
+        node_id = "path::TestName", body = function source slice.
+      - JavaScript/TypeScript (*.test.{ts,tsx,js,jsx} / *.spec.* / __tests__/):
+        `it('…')` / `test('…')` blocks. node_id = "path::display title",
+        body = surrounding lines. Not executable via _run_companion_test
+        (which only does `node --check`), but the surfaced names provide
+        the model with high-signal context about what the codebase tests.
+      - Rust (*.rs with `#[test]`): #[test]-annotated functions.
+        node_id = "path::test_name", body = function source slice.
+
+    Discovery is keyword-scored; tests whose name shares tokens with the
+    issue float to the top. Cross-language ordering is by score, so a
+    high-relevance Go test beats a low-relevance Python test.
+    """
     import ast
 
     if tracked is None:
@@ -2684,24 +2952,29 @@ def _discover_likely_test_nodes(
     if not keywords:
         keywords = _issue_terms(issue_text)[:6]
 
+    def _score_name(name: str) -> int:
+        nl = name.lower()
+        return sum(2 for kw in keywords if kw in nl)
+
+    def _slice_body(content: str, start_line: int, max_lines: int = 60) -> str:
+        lines = content.splitlines()
+        end_line = min(len(lines), start_line + max_lines - 1)
+        return "\n".join(lines[start_line - 1 : end_line])
+
     scored: List[Tuple[int, str, str]] = []
-    test_files = [
+
+    # ---- Python ----------------------------------------------------------
+    py_files = [
         p for p in tracked
         if p.endswith(".py") and ("test" in Path(p).name.lower() or "/test" in p.lower())
     ]
-
-    for relative_path in test_files[:40]:
+    for relative_path in py_files[:40]:
         full = repo / relative_path
         try:
             content = full.read_text(encoding="utf-8", errors="replace")
             tree = ast.parse(content, filename=str(relative_path))
         except Exception:
             continue
-
-        def _score_name(name: str) -> int:
-            nl = name.lower()
-            return sum(2 for kw in keywords if kw in nl)
-
         for node in ast.walk(tree):
             if isinstance(node, ast.ClassDef):
                 for child in node.body:
@@ -2721,6 +2994,245 @@ def _discover_likely_test_nodes(
                 body = _get_python_function_body(repo, relative_path, node.name)
                 if body:
                     scored.append((score, node_id, body))
+
+    # ---- Go --------------------------------------------------------------
+    go_files = [p for p in tracked if p.endswith("_test.go")]
+    for relative_path in go_files[:40]:
+        full = repo / relative_path
+        try:
+            content = full.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for m in _GO_TEST_FUNC_RE.finditer(content):
+            name = m.group(1)
+            score = _score_name(name)
+            if score <= 0:
+                continue
+            start_line = content.count("\n", 0, m.start()) + 1
+            body = _slice_body(content, start_line)
+            scored.append((score, f"{relative_path}::{name}", body))
+
+    # ---- JavaScript / TypeScript ----------------------------------------
+    js_files = [
+        p for p in tracked
+        if Path(p).suffix.lower() in {".js", ".jsx", ".ts", ".tsx", ".cjs", ".mjs"}
+        and (
+            ".test." in Path(p).name.lower()
+            or ".spec." in Path(p).name.lower()
+            or "__tests__" in p.lower()
+            or "/test/" in p.lower()
+            or "/tests/" in p.lower()
+            or p.lower().startswith("test/")
+            or p.lower().startswith("tests/")
+        )
+    ]
+    for relative_path in js_files[:40]:
+        full = repo / relative_path
+        try:
+            content = full.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for m in _JS_TEST_BLOCK_RE.finditer(content):
+            title = m.group(1)
+            score = _score_name(title)
+            if score <= 0:
+                continue
+            start_line = content.count("\n", 0, m.start()) + 1
+            body = _slice_body(content, start_line, max_lines=30)
+            scored.append((score, f"{relative_path}::{title}", body))
+
+    # ---- PHP -------------------------------------------------------------
+    php_files = [
+        p for p in tracked
+        if p.endswith(".php") and (
+            "test" in Path(p).name.lower()
+            or "tests/" in p.lower()
+            or "/test/" in p.lower()
+            or p.lower().startswith("test/")
+        )
+    ]
+    for relative_path in php_files[:40]:
+        full = repo / relative_path
+        try:
+            content = full.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for m in _PHP_TEST_FUNC_RE.finditer(content):
+            name = m.group(1)
+            score = _score_name(name)
+            if score <= 0:
+                continue
+            start_line = content.count("\n", 0, m.start()) + 1
+            body = _slice_body(content, start_line)
+            scored.append((score, f"{relative_path}::{name}", body))
+        for m in _PHP_ANNOTATED_TEST_RE.finditer(content):
+            name = m.group(1)
+            score = _score_name(name)
+            if score <= 0:
+                continue
+            start_line = content.count("\n", 0, m.start()) + 1
+            body = _slice_body(content, start_line)
+            scored.append((score, f"{relative_path}::{name}", body))
+
+    # ---- Ruby ------------------------------------------------------------
+    ruby_files = [
+        p for p in tracked
+        if p.endswith(".rb") and (
+            "spec/" in p.lower()
+            or "/test/" in p.lower()
+            or "tests/" in p.lower()
+            or p.lower().startswith("spec/")
+            or p.lower().startswith("test/")
+            or "_spec.rb" in p.lower()
+            or "_test.rb" in p.lower()
+        )
+    ]
+    for relative_path in ruby_files[:40]:
+        full = repo / relative_path
+        try:
+            content = full.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for m in _RUBY_RSPEC_RE.finditer(content):
+            title = m.group(1)
+            score = _score_name(title)
+            if score <= 0:
+                continue
+            start_line = content.count("\n", 0, m.start()) + 1
+            body = _slice_body(content, start_line, max_lines=30)
+            scored.append((score, f"{relative_path}::{title}", body))
+        for m in _RUBY_MINITEST_RE.finditer(content):
+            name = m.group(1)
+            score = _score_name(name)
+            if score <= 0:
+                continue
+            start_line = content.count("\n", 0, m.start()) + 1
+            body = _slice_body(content, start_line)
+            scored.append((score, f"{relative_path}::{name}", body))
+
+    # ---- Java ------------------------------------------------------------
+    java_files = [
+        p for p in tracked
+        if p.endswith(".java") and (
+            "test" in Path(p).name.lower()
+            or "/test/" in p.lower()
+            or "tests/" in p.lower()
+            or "/src/test/" in p.lower()
+        )
+    ]
+    for relative_path in java_files[:40]:
+        full = repo / relative_path
+        try:
+            content = full.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for m in _JAVA_TEST_FUNC_RE.finditer(content):
+            name = m.group(1)
+            score = _score_name(name)
+            if score <= 0:
+                continue
+            start_line = content.count("\n", 0, m.start()) + 1
+            body = _slice_body(content, start_line)
+            scored.append((score, f"{relative_path}::{name}", body))
+
+    # ---- Kotlin ----------------------------------------------------------
+    kotlin_files = [
+        p for p in tracked
+        if p.endswith(".kt") and (
+            "test" in Path(p).name.lower()
+            or "/test/" in p.lower()
+            or "tests/" in p.lower()
+            or "/src/test/" in p.lower()
+        )
+    ]
+    for relative_path in kotlin_files[:40]:
+        full = repo / relative_path
+        try:
+            content = full.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for m in _KOTLIN_TEST_FUNC_RE.finditer(content):
+            name = m.group(1).strip("`")
+            score = _score_name(name)
+            if score <= 0:
+                continue
+            start_line = content.count("\n", 0, m.start()) + 1
+            body = _slice_body(content, start_line)
+            scored.append((score, f"{relative_path}::{name}", body))
+
+    # ---- Swift -----------------------------------------------------------
+    swift_files = [
+        p for p in tracked
+        if p.endswith(".swift") and (
+            "test" in Path(p).name.lower()
+            or "tests/" in p.lower()
+            or "Tests/" in p
+        )
+    ]
+    for relative_path in swift_files[:40]:
+        full = repo / relative_path
+        try:
+            content = full.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for m in _SWIFT_TEST_FUNC_RE.finditer(content):
+            name = m.group(1)
+            score = _score_name(name)
+            if score <= 0:
+                continue
+            start_line = content.count("\n", 0, m.start()) + 1
+            body = _slice_body(content, start_line)
+            scored.append((score, f"{relative_path}::{name}", body))
+
+    # ---- C / C++ (GoogleTest) -------------------------------------------
+    cpp_files = [
+        p for p in tracked
+        if Path(p).suffix.lower() in {".cc", ".cpp", ".cxx", ".c", ".h", ".hpp"}
+        and (
+            "test" in Path(p).name.lower()
+            or "tests/" in p.lower()
+            or "/test/" in p.lower()
+        )
+    ]
+    for relative_path in cpp_files[:40]:
+        full = repo / relative_path
+        try:
+            content = full.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for m in _CPP_GTEST_RE.finditer(content):
+            suite, test_name = m.group(1), m.group(2)
+            score = _score_name(f"{suite}_{test_name}")
+            if score <= 0:
+                continue
+            start_line = content.count("\n", 0, m.start()) + 1
+            body = _slice_body(content, start_line)
+            scored.append((score, f"{relative_path}::{suite}.{test_name}", body))
+
+    # ---- Rust ------------------------------------------------------------
+    rust_files = [
+        p for p in tracked
+        if p.endswith(".rs") and (
+            "test" in Path(p).name.lower()
+            or "tests/" in p.lower()
+            or "/test/" in p.lower()
+            or p.lower().startswith("test/")
+        )
+    ]
+    for relative_path in rust_files[:40]:
+        full = repo / relative_path
+        try:
+            content = full.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for m in _RUST_TEST_FUNC_RE.finditer(content):
+            name = m.group(1)
+            score = _score_name(name)
+            if score <= 0:
+                continue
+            start_line = content.count("\n", 0, m.start()) + 1
+            body = _slice_body(content, start_line)
+            scored.append((score, f"{relative_path}::{name}", body))
 
     scored.sort(key=lambda x: (-x[0], x[1]))
     out: List[Tuple[str, str]] = []
@@ -2758,6 +3270,117 @@ def _format_action_observation(result: CommandResult, command: str = "") -> str:
                 parts.extend(["", "STDERR_TAIL:", _truncate(result.stderr, 2000)])
             return "\n".join(parts) + "\n"
     return format_observation(result)
+
+
+def _detect_js_test_runner(repo: Path) -> Optional[str]:
+    """Look at package.json for which JS test runner the project declares.
+
+    Returns 'vitest', 'jest', or None when no recognized runner is found.
+    Used by both _run_js_ts_test (companion-test execution) and the
+    targeted-test-command suggestion path.
+    """
+    pkg_path = repo / "package.json"
+    if not pkg_path.exists():
+        return None
+    try:
+        data = json.loads(pkg_path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    devdeps = data.get("devDependencies") if isinstance(data.get("devDependencies"), dict) else {}
+    deps = data.get("dependencies") if isinstance(data.get("dependencies"), dict) else {}
+    scripts = data.get("scripts") if isinstance(data.get("scripts"), dict) else {}
+    combined = {**(deps or {}), **(devdeps or {})}
+    script_blob = " ".join(str(v) for v in (scripts or {}).values() if isinstance(v, str)).lower()
+    if "vitest" in combined or "vitest" in script_blob:
+        return "vitest"
+    if "jest" in combined or "jest" in script_blob:
+        return "jest"
+    return None
+
+
+def _run_js_ts_test(
+    repo: Path,
+    test_path: str,
+    *,
+    timeout_seconds: int = 8,
+    node_id: Optional[str] = None,
+) -> Optional[str]:
+    """Run a JS/TS test file through the project's declared runner if any.
+
+    Returns the failure tail on FAIL, or None when:
+      - no runner detected (caller should fall back to `node --check`)
+      - the runner isn't on PATH
+      - the run times out / errors environmentally
+
+    When node_id contains "path::title", -t '<title>' is appended so we
+    only run the matching block. The title is single-quote-escaped for
+    safe shell embedding.
+
+    Why this exists: ~50% of the GitHub-derived task corpus is JS/TS.
+    The pre-solve probe + post-edit baseline-verify gate only produce
+    useful signals when the runner can actually return pass/fail.
+    `node --check` only catches syntax errors, missing the regression
+    class the gate is designed for.
+    """
+    runner = _detect_js_test_runner(repo)
+    if not runner:
+        return None
+    npx_path = shutil.which("npx") or shutil.which("yarn") or shutil.which("pnpm")
+    if not npx_path:
+        return None
+
+    test_title: Optional[str] = None
+    if node_id and "::" in node_id:
+        candidate = node_id.split("::", 1)[1].strip()
+        if candidate:
+            test_title = candidate
+
+    if runner == "vitest":
+        cmd: List[str] = ["npx", "--no-install", "vitest", "run", test_path]
+        if test_title:
+            cmd.extend(["-t", test_title])
+        cmd.extend(["--reporter=default", "--no-color"])
+    else:  # jest
+        cmd = ["npx", "--no-install", "jest", test_path, "--no-color"]
+        if test_title:
+            cmd.extend(["-t", test_title])
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=max(timeout_seconds, 25),
+            env=_command_env(),
+        )
+    except subprocess.TimeoutExpired:
+        return f"Companion test `{test_path}` ({runner}) timed out after {max(timeout_seconds, 25)}s."
+    except Exception:
+        return None
+
+    output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+    if not output:
+        return None
+    # Environmental noise: missing runner, missing module, install needed —
+    # these are not real test failures; return None so we don't queue a fix
+    # turn the agent can't act on.
+    env_markers = (
+        "could not determine executable",
+        "npm ERR! could not resolve",
+        "Cannot find module",
+        "ERR_MODULE_NOT_FOUND",
+        "command not found",
+        "is not a valid",
+    )
+    if any(marker.lower() in output.lower() for marker in env_markers):
+        return None
+    if proc.returncode == 0:
+        return None
+    return output[-2400:] if len(output) > 2400 else output
 
 
 def _run_companion_test(
@@ -2841,7 +3464,14 @@ def _run_companion_test(
         return None
 
     # ---- JS / TS ----
+    # Try a real test runner (vitest/jest) when the repo declares one in
+    # package.json; otherwise fall back to `node --check` (parse-only).
     if suffix in {".ts", ".tsx", ".js", ".jsx", ".cjs", ".mjs"}:
+        runner_result = _run_js_ts_test(
+            repo, test_path, timeout_seconds=timeout_seconds, node_id=node_id
+        )
+        if runner_result is not None:
+            return runner_result
         if not _has_executable("node"):
             return None
         try:
@@ -2876,9 +3506,18 @@ def _run_companion_test(
         pkg_dir = str(Path(test_path).parent) or "."
         pkg_target = "./" + pkg_dir if pkg_dir != "." else "./..."
         go_timeout = max(timeout_seconds, 15)  # cold cache needs more than 8s
+        # Filter to a specific test function when node_id was provided in
+        # "path/file_test.go::TestFoo" form. Anchored regex prevents accidental
+        # matching of TestFooBar when only TestFoo was meant.
+        go_cmd = ["go", "test", "-count=1", "-timeout", "10s"]
+        if node_id and "::" in node_id:
+            test_func = node_id.split("::", 1)[1]
+            if test_func and test_func.replace("_", "").isalnum():
+                go_cmd.extend(["-run", f"^{test_func}$"])
+        go_cmd.append(pkg_target)
         try:
             proc = subprocess.run(
-                ["go", "test", "-count=1", "-timeout", "10s", pkg_target],
+                go_cmd,
                 cwd=str(repo),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -2930,7 +3569,170 @@ def _run_companion_test(
         output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
         return output[-2400:] if len(output) > 2400 else output
 
+    # ---- PHP / phpunit ---------------------------------------------------
+    if suffix == ".php":
+        if not _has_executable("php"):
+            return None
+        phpunit_bin = repo / "vendor/bin/phpunit"
+        if phpunit_bin.exists():
+            cmd_prefix = ["php", str(phpunit_bin)]
+        elif _has_executable("phpunit"):
+            cmd_prefix = ["phpunit"]
+        else:
+            return None
+        cmd = list(cmd_prefix) + ["--no-coverage", "--stop-on-failure", test_path]
+        if node_id and "::" in node_id:
+            test_func = node_id.split("::", 1)[1]
+            if test_func and test_func.replace("_", "").isalnum():
+                cmd.extend(["--filter", test_func])
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=max(timeout_seconds, 25),
+                env=_command_env(),
+            )
+        except subprocess.TimeoutExpired:
+            return f"Companion test `{test_path}` (phpunit) timed out after {max(timeout_seconds, 25)}s."
+        except Exception:
+            return None
+        if proc.returncode == 0:
+            return None
+        output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+        if any(noise in output.lower() for noise in (
+            "could not open input file", "phpunit not found", "no autoloader"
+        )):
+            return None
+        return output[-2400:] if len(output) > 2400 else output
+
+    # ---- Ruby / rspec or minitest ----------------------------------------
+    if suffix == ".rb":
+        if not _has_executable("ruby"):
+            return None
+        # Prefer rspec for spec/* paths, minitest otherwise
+        is_spec = "spec/" in test_path or test_path.endswith("_spec.rb")
+        if is_spec:
+            if (repo / "Gemfile.lock").exists() and _has_executable("bundle"):
+                cmd: List[str] = ["bundle", "exec", "rspec", test_path, "--no-color"]
+            elif _has_executable("rspec"):
+                cmd = ["rspec", test_path, "--no-color"]
+            else:
+                return None
+            if node_id and "::" in node_id:
+                title = node_id.split("::", 1)[1]
+                if title:
+                    cmd.extend(["-e", title])
+        else:
+            cmd = ["ruby", "-Itest", "-Ilib", test_path]
+            if node_id and "::" in node_id:
+                title = node_id.split("::", 1)[1]
+                if title and title.startswith("test_"):
+                    cmd.extend(["-n", title])
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=max(timeout_seconds, 25),
+                env=_command_env(),
+            )
+        except subprocess.TimeoutExpired:
+            return f"Companion test `{test_path}` (ruby) timed out after {max(timeout_seconds, 25)}s."
+        except Exception:
+            return None
+        if proc.returncode == 0:
+            return None
+        output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+        if any(noise in output.lower() for noise in (
+            "command not found", "cannot load such file", "could not find gem"
+        )):
+            return None
+        return output[-2400:] if len(output) > 2400 else output
+
     return None  # other languages: skip
+
+
+def _run_failing_tests_baseline(
+    repo: Path,
+    candidate_nodes: List[Tuple[str, str]],
+    timeout_seconds: int = 6,
+    max_tests: int = 3,
+) -> List[Tuple[str, str]]:
+    """Pre-solve probe: run candidate test nodes on the unpatched repo to find
+    ones that already fail. A test failing on the unpatched repo is a ground-
+    truth demonstration of the bug — the right fix should make it pass.
+
+    Returns (node_id, failure_tail) pairs in input order, capped at max_tests.
+    Skips tests that pass, error out for environmental reasons, time out,
+    or run on languages _run_companion_test doesn't handle. Best-effort.
+
+    Total wall cost bounded by max_tests * timeout_seconds (~18-24s default).
+    Callers should gate by available wall-clock budget before invoking.
+    """
+    out: List[Tuple[str, str]] = []
+    for node_id, _body in candidate_nodes[:max_tests]:
+        test_path = node_id.split("::", 1)[0]
+        failure = _run_companion_test(
+            repo, test_path, timeout_seconds=timeout_seconds, node_id=node_id
+        )
+        if failure:
+            out.append((node_id, failure))
+    return out
+
+
+def _verify_baseline_tests_pass(
+    repo: Path,
+    baseline_failing: List[Tuple[str, str]],
+    timeout_seconds: int = 6,
+) -> Optional[Tuple[str, str]]:
+    """Re-run the originally-failing tests against the now-patched repo.
+
+    Returns (node_id, new_failure_tail) for the first test that STILL fails,
+    or None when every baseline-failing test now passes. None means the patch
+    is verified against the ground-truth bug demonstrations the agent saw at
+    the top of its prompt — a strong success signal.
+
+    Best-effort: any runner-unavailable / timed-out test contributes nothing.
+    Stops at the first still-failing test so callers can fix one at a time.
+    """
+    for node_id, _baseline_tail in baseline_failing:
+        test_path = node_id.split("::", 1)[0]
+        new_failure = _run_companion_test(
+            repo, test_path, timeout_seconds=timeout_seconds, node_id=node_id
+        )
+        if new_failure:
+            return (node_id, new_failure)
+    return None
+
+
+def _format_failing_tests_section(failing: List[Tuple[str, str]]) -> str:
+    """Render baseline failing-test output as a primary-context block to inject
+    at the top of the initial user prompt. Each entry surfaces the test node id
+    and the failure tail — ground-truth verification targets the patch should
+    satisfy. Empty input returns an empty string so the caller can prepend
+    unconditionally."""
+    if not failing:
+        return ""
+    parts = [
+        "### Currently failing tests on this repo (run BEFORE any edits — these demonstrate the issue)",
+        "Make these tests pass. Their failures are the ground-truth verification target. "
+        "After your final edits, the patch should be the minimal change that turns each failure below into a pass.",
+        "",
+    ]
+    for node_id, tail in failing[:3]:
+        if len(tail) > 1800:
+            tail = tail[:900] + "\n…[truncated middle]…\n" + tail[-800:]
+        parts.append(f"#### `{node_id}`")
+        parts.append("```")
+        parts.append(tail)
+        parts.append("```")
+        parts.append("")
+    return "\n".join(parts) + "\n"
 
 
 def _select_companion_test_failure(
@@ -2985,6 +3787,76 @@ def _companion_test_timeout_seconds(command_timeout: int, remaining_seconds: flo
     return int(min(max(8, command_timeout // 2), 14, max(8, remaining_seconds // 6)))
 
 
+def _build_targeted_test_command(repo: Path, node_id_or_path: str) -> Optional[str]:
+    """Compose a single repo-local verification command for a node-id or path.
+
+    Accepts either a pure file path or a "path::member" identifier. Picks
+    the right runner for each language and includes a name filter when the
+    node-id carries one:
+
+      - .py with member  → `pytest path::name -x -q --tb=short --no-header`
+      - .py file only    → `pytest path` (via _build_pytest_bash when available)
+      - .go with member  → `go test ./pkg -run '^Name$' -count=1`
+      - .ts/.tsx/.js/.jsx with member → `npx vitest run path -t 'name'` or jest
+      - .rs with member  → `cargo test --offline -q name`
+      - .rb / .php       → language-appropriate fallback
+
+    Returns None when no command can be composed (e.g. unknown extension).
+    """
+    if "::" in node_id_or_path:
+        test_path, _, member = node_id_or_path.partition("::")
+    else:
+        test_path, member = node_id_or_path, ""
+    test_path = test_path.strip()
+    member = (member or "").strip()
+    if not test_path:
+        return None
+    suffix = Path(test_path).suffix.lower()
+
+    if suffix == ".py":
+        if member:
+            return f"python3 -m pytest '{test_path}::{member}' -x -q --tb=short --no-header"
+        cmd = _build_pytest_bash(repo, file_paths=[test_path])
+        if cmd:
+            return cmd
+        return f"python3 -m pytest '{test_path}' -x -q --tb=short --no-header"
+
+    if suffix == ".go":
+        pkg = str(Path(test_path).parent) or "."
+        pkg_target = f"./{pkg}" if pkg != "." else "./..."
+        if member and member.replace("_", "").isalnum():
+            return f"go test {pkg_target} -run '^{member}$' -count=1 -timeout 60s"
+        return f"go test {pkg_target} -count=1 -timeout 60s"
+
+    if suffix in {".ts", ".tsx", ".js", ".jsx", ".cjs", ".mjs"}:
+        runner = _detect_js_test_runner(repo)
+        quoted_member = member.replace("'", "'\"'\"'") if member else ""
+        if runner == "vitest":
+            base = f"npx --no-install vitest run '{test_path}'"
+            return f"{base} -t '{quoted_member}'" if member else base
+        if runner == "jest":
+            base = f"npx --no-install jest '{test_path}'"
+            return f"{base} -t '{quoted_member}'" if member else base
+        if member:
+            return f"npm test -- '{test_path}' -t '{quoted_member}'"
+        return f"npm test -- '{test_path}'"
+
+    if suffix == ".rs":
+        if member and member.replace("_", "").isalnum():
+            return f"cargo test --offline -q {member}"
+        return "cargo test --offline -q"
+
+    if suffix == ".rb":
+        if "spec/" in test_path:
+            return f"bundle exec rspec '{test_path}'"
+        return f"ruby -Itest '{test_path}'"
+
+    if suffix == ".php":
+        return f"vendor/bin/phpunit '{test_path}'"
+
+    return None
+
+
 def _suggest_targeted_test_command(
     repo: Path,
     patch: str,
@@ -2992,17 +3864,23 @@ def _suggest_targeted_test_command(
     known_node_ids: Optional[List[str]] = None,
     failed_node_ids: Optional[List[str]] = None,
 ) -> Optional[str]:
-    """Return a single repo-local verification command for edited companion tests."""
+    """Return a single repo-local verification command appropriate for the
+    languages the patch touched.
+
+    Priority:
+      1. A test we already observed failing (failed_node_ids)
+      2. A likely-relevant test from issue-keyword discovery (known_node_ids)
+      3. A test partner derived from the edited files
+    """
     if failed_node_ids:
         node = failed_node_ids[0]
-        if node.endswith(".py") or "::" in node:
-            cmd = _build_pytest_bash(repo, node_ids=[node])
-            if cmd:
-                return cmd
+        cmd = _build_targeted_test_command(repo, node)
+        if cmd:
+            return cmd
 
     if known_node_ids:
         node = known_node_ids[0]
-        cmd = _build_pytest_bash(repo, node_ids=[node])
+        cmd = _build_targeted_test_command(repo, node)
         if cmd:
             return cmd
 
@@ -3014,19 +3892,9 @@ def _suggest_targeted_test_command(
         partner = _find_test_partner(relative_path, tracked)
         if not partner:
             continue
-        suffix = Path(partner).suffix.lower()
-        if suffix == ".py":
-            cmd = _build_pytest_bash(repo, file_paths=[partner])
-            if cmd:
-                return cmd
-            return f"python3 -m pytest '{partner}' -x -q --tb=short --no-header"
-        if suffix in {".ts", ".tsx", ".js", ".jsx"}:
-            return f"npm test -- {partner}"
-        if suffix == ".go":
-            pkg = str(Path(partner).parent) or "."
-            return f"go test {pkg} -count=1"
-        if suffix == ".rs":
-            return "cargo test --offline -q"
+        cmd = _build_targeted_test_command(repo, partner)
+        if cmd:
+            return cmd
     return None
 
 
@@ -3301,6 +4169,54 @@ def _detect_junk_placeholders(patch: str) -> List[str]:
     return findings
 
 
+_NEGATIVE_CRITERIA_RE = re.compile(
+    r"\b(?:"
+    r"without\s+(?:modifying|changing|breaking|touching|altering)"
+    r"|do\s+not\s+(?:modify|change|break|touch|alter|remove|delete)"
+    r"|must\s+not\s+(?:modify|change|break|touch|alter|remove|delete)"
+    r"|preserve\s+(?:the\s+)?existing"
+    r"|keep\s+(?:the\s+)?(?:existing|current)"
+    r"|backward[- ]compatible"
+    r")"
+    # Skip up to 3 articles/adjectives before capturing the actual target noun.
+    # Otherwise the capture lands on "the"/"a"/"any" instead of the file name.
+    r"\s+(?:(?:the|a|an|all|any|old|legacy|existing|unused|deprecated|current|original|previous)\s+){0,3}"
+    # Optional opening backtick or single-quote so "do not modify `auth.py`"
+    # captures `auth.py` instead of failing on the backtick boundary.
+    r"[`'\"]?"
+    r"([A-Za-z][\w./_-]{2,60})?",
+    re.IGNORECASE,
+)
+
+# Captured tokens that are too generic to count as a real path/identifier target.
+_NEGATIVE_TARGET_STOPWORDS = frozenset({
+    "the", "a", "an", "any", "all", "old", "new", "current", "existing",
+    "legacy", "previous", "original", "this", "that", "these", "those",
+    "code", "logic", "behavior", "behaviour", "way", "rest", "thing", "part",
+    "file", "files", "function", "functions", "method", "methods", "class",
+    "test", "tests", "api", "ui",
+})
+
+
+def _extract_negative_targets(issue_text: str) -> List[str]:
+    """Tokens the patch must NOT modify, parsed from negative criteria.
+
+    Returns lower-cased candidate identifiers. Empty when the issue has no
+    negative-criteria phrases — the cheap path stays cheap.
+    """
+    out: List[str] = []
+    for m in _NEGATIVE_CRITERIA_RE.finditer(issue_text or ""):
+        target = (m.group(1) or "").strip(".,;:") if m.lastindex else ""
+        if not target or len(target) < 3:
+            continue
+        low = target.lower()
+        if low in _NEGATIVE_TARGET_STOPWORDS:
+            continue
+        if low not in out:
+            out.append(low)
+    return out
+
+
 def _patch_ship_blockers(patch: str, issue: str) -> List[str]:
     """Structural gaps that correlate with weak patches.
 
@@ -3326,6 +4242,17 @@ def _patch_ship_blockers(patch: str, issue: str) -> List[str]:
     junk = _detect_junk_placeholders(patch)
     if junk:
         blockers.append("junk_placeholder_tokens")
+    # Negative-criteria violation: issue says "do not modify foo" and the
+    # patch touches a path containing "foo". Cheap substring match; only
+    # fires when the issue has explicit negative phrasing.
+    negative_targets = _extract_negative_targets(issue)
+    if negative_targets:
+        touched = [f.lower() for f in _patch_changed_files(patch)]
+        for forbidden in negative_targets:
+            for f in touched:
+                if forbidden in f:
+                    blockers.append(f"forbidden_path_touched:{forbidden}")
+                    break
     return blockers
 
 
@@ -3476,18 +4403,23 @@ def build_ship_blocker_prompt(blockers: List[str], issue: str) -> str:
     )
 
 
-def _recent_commit_examples(repo: Path) -> str:
+def _recent_commit_examples(repo: Path, issue_text: str = "") -> str:
     """v21 edge: read recent small-diff commits from the staged repo via git log
     and format them as in-context style anchors. Returns empty string when the
     repo has no real history (single synthetic commit in pilot snapshots), so
     this is a silent no-op locally and a real lift live where the validator
     clones the upstream repo with full history.
 
-    The model imitates concrete examples better than abstract rules. Showing the
-    model 1-2 real recent commits gives it a concise local style anchor."""
+    The model imitates concrete examples better than abstract rules. Showing
+    1-2 real recent commits gives it a concise local style anchor.
+
+    When the issue mentions specific files that exist in the repo, prefer
+    commits that touched those files first — the patch shape for the
+    immediate edit area is the strongest possible style anchor.
+    """
     try:
         proc = subprocess.run(
-            ["git", "log", "--no-merges", "--pretty=format:%H", "-n", "20"],
+            ["git", "log", "--no-merges", "--pretty=format:%H", "-n", "40"],
             cwd=str(repo),
             capture_output=True,
             text=True,
@@ -3498,9 +4430,39 @@ def _recent_commit_examples(repo: Path) -> str:
         shas = [s.strip() for s in proc.stdout.splitlines() if s.strip()]
         if len(shas) < 2:
             return ""  # single synthetic commit (pilot) — silent no-op
+
+        # File-targeted preselection: pull commits that touched paths the
+        # issue names. Falls back to general recent commits if none exist.
+        targeted_shas: List[str] = []
+        if issue_text:
+            try:
+                mentioned_paths = _extract_issue_path_mentions(issue_text)
+                tracked = set(_tracked_files(repo))
+                relevant_paths = [
+                    p.strip("./") for p in mentioned_paths if p.strip("./") in tracked
+                ][:5]
+            except Exception:
+                relevant_paths = []
+            if relevant_paths:
+                try:
+                    tlog = subprocess.run(
+                        ["git", "log", "--no-merges", "--pretty=format:%H", "-n", "20", "--"] + relevant_paths,
+                        cwd=str(repo),
+                        capture_output=True,
+                        text=True,
+                        timeout=8,
+                    )
+                    if tlog.returncode == 0:
+                        targeted_shas = [s.strip() for s in tlog.stdout.splitlines() if s.strip()]
+                except Exception:
+                    pass
+
+        # Try targeted SHAs first, then fall back to general recent SHAs.
+        # De-dupe so we don't show the same commit twice.
+        ordered = list(dict.fromkeys(targeted_shas + shas))
         examples: List[str] = []
         budget_used = 0
-        for sha in shas:
+        for sha in ordered:
             stat_proc = subprocess.run(
                 ["git", "show", "--no-merges", "--shortstat", "--pretty=format:", sha],
                 cwd=str(repo),
@@ -3573,15 +4535,172 @@ _CRITERIA_STOP = frozenset({
 })
 
 
+_CRITERIA_SECTION_HEADERS = re.compile(
+    r"^\s*(?:#+\s*)?(?:\*\*)?(?:"
+    r"acceptance(?:\s+criteria)?"
+    r"|expected(?:\s+behavi[ou]r)?"
+    r"|requirements?"
+    r"|definition\s+of\s+done"
+    r"|success\s+criteria"
+    r"|must\s+have"
+    r"|todo"
+    r"|checklist"
+    # Allow the trailing colon either INSIDE the closing `**` (`**Requirements:**`)
+    # or OUTSIDE it (`**Requirements**:`), and tolerate an optional dash/em-dash.
+    r")\s*[:\-—]?\s*(?:\*\*)?\s*[:\-—]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _criteria_from_sections(issue_text: str) -> List[str]:
+    """Bullets nested under a recognized acceptance/requirements section header.
+
+    Most GitHub issue templates use one of these headers; bullets nested below
+    count as criteria. Up to 2 lines of prose are tolerated between the header
+    and the first bullet (some issue templates write "The component must:\\n\\n- …"
+    or have a transition sentence). A new section-header line or a third
+    non-bullet line ends the section.
+    """
+    lines = issue_text.splitlines()
+    bullet_re = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+(.+?)\s*$")
+    out: List[str] = []
+    i = 0
+    while i < len(lines):
+        if _CRITERIA_SECTION_HEADERS.match(lines[i]):
+            j = i + 1
+            seen_bullet = False
+            prose_streak = 0  # consecutive non-bullet, non-blank prose lines
+            while j < len(lines):
+                line = lines[j]
+                if not line.strip():
+                    j += 1
+                    continue
+                # A new section header always ends the current section.
+                if _CRITERIA_SECTION_HEADERS.match(line):
+                    break
+                m = bullet_re.match(line)
+                if m:
+                    text = m.group(1).strip()
+                    if len(text) >= 6:
+                        out.append(text[:_CRITERIA_MAX_TEXT])
+                    seen_bullet = True
+                    prose_streak = 0
+                    j += 1
+                    continue
+                # Non-bullet line. Tolerate up to 2 prose lines before bullets
+                # appear; once any bullet has been seen, the first non-bullet
+                # line ends the section as before.
+                if seen_bullet or prose_streak >= 2:
+                    break
+                prose_streak += 1
+                j += 1
+            i = j
+        else:
+            i += 1
+        if len(out) >= _CRITERIA_MAX_BULLETS:
+            break
+    return out
+
+
+_NUMERIC_CONSTRAINT_PATTERNS = [
+    # Verbal phrasings — "at least N", "minimum N", etc. Capture group 1 = N.
+    (re.compile(r"\bat\s+least\s+(\d+)\s+(\w+)", re.IGNORECASE), "at least {0} {1}"),
+    (re.compile(r"\bminimum\s+(?:of\s+)?(\d+)\s+(\w+)", re.IGNORECASE), "minimum {0} {1}"),
+    (re.compile(r"\bexactly\s+(\d+)\s+(\w+)", re.IGNORECASE), "exactly {0} {1}"),
+    (re.compile(r"\b(?:more|greater)\s+than\s+(\d+)\s+(\w+)", re.IGNORECASE), "more than {0} {1}"),
+    (re.compile(r"\b(?:fewer|less)\s+than\s+(\d+)\s+(\w+)", re.IGNORECASE), "less than {0} {1}"),
+    (re.compile(r"\bmaximum\s+(?:of\s+)?(\d+)\s+(\w+)", re.IGNORECASE), "maximum {0} {1}"),
+    (re.compile(r"\bup\s+to\s+(\d+)\s+(\w+)", re.IGNORECASE), "up to {0} {1}"),
+    # Regex literals visible in the issue body (developers paste these often).
+    (re.compile(r"`?(/\^?\\d\{\d+,?\d*\}\$?/)`?"), "regex constraint: {0}"),
+    (re.compile(r"`(\\d\{\d+,?\d*\})`"), "digit pattern: {0}"),
+]
+
+# Structural-directive phrasings. Captures the noun (file/module/component/etc.)
+# that the issue says to split, extract, or relocate.
+_STRUCTURAL_DIRECTIVE_PATTERNS = [
+    (re.compile(
+        r"\b(?:extract|split|move|relocate|migrate)\b[^.]{0,80}?\b"
+        r"(?:into|to)\s+(?:a\s+)?(?:separate|new|dedicated|its\s+own)\s+"
+        r"(file|module|component|class|struct|function|helper|service|package)\b",
+        re.IGNORECASE,
+    ), "structural: split into a separate {0}"),
+    (re.compile(
+        r"\bcreate\s+(?:a\s+|an\s+)?(?:dedicated|separate|new|standalone)\s+"
+        r"(file|module|component|class|struct|function|helper|service|package)\b",
+        re.IGNORECASE,
+    ), "structural: create a new {0}"),
+    (re.compile(
+        r"\brefactor\s+(?:[^.]{0,60}?)\binto\s+(?:separate|distinct|individual)\s+"
+        r"(\w+)",
+        re.IGNORECASE,
+    ), "structural: refactor into separate {0}"),
+]
+
+
+def _extract_implicit_constraints(issue_text: str, max_constraints: int = 5) -> List[str]:
+    """Extract implicit numeric thresholds and structural directives the issue
+    states but doesn't always surface as explicit bullets.
+
+    These come back as criterion-shaped strings so they can flow through the
+    existing acceptance-criteria pipeline: final-checklist enforcement,
+    criteria-nudge refinement, and the failure-mode diagnosis path all
+    consume the same list.
+
+    Targets the two non-criteria-coverage loss patterns observed in bench
+    data: (1) numeric thresholds in flowing prose ("must be at least 4
+    digits") and (2) structural-refactor verbs ("extract X into separate
+    module") that aren't bullet-listed.
+
+    Pure regex; no LLM call. Returns ≤ max_constraints distinct strings.
+    """
+    if not issue_text:
+        return []
+    seen: set = set()
+    out: List[str] = []
+    for pattern, template in _NUMERIC_CONSTRAINT_PATTERNS + _STRUCTURAL_DIRECTIVE_PATTERNS:
+        for m in pattern.finditer(issue_text):
+            try:
+                groups = m.groups()
+                rendered = template.format(*groups) if groups else template
+            except Exception:
+                continue
+            key = rendered.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(rendered[:_CRITERIA_MAX_TEXT])
+            if len(out) >= max_constraints:
+                return out
+    return out
+
+
 def _extract_acceptance_criteria(issue_text: str) -> List[str]:
     """Pull acceptance-criterion checkpoints from the issue text.
 
-    Heuristic: numbered lines (`1.` or `1)`) and dashed bullets (`-` / `*` /
-    `•`) first; fallback to imperative sentences (must/should/implement/add/
-    support/ensure) when no list structure exists. Caps at _CRITERIA_MAX_BULLETS
-    so the nudge prompt stays compact."""
+    Order:
+      1. Bullets under a recognized section header (most reliable)
+      2. Raw numbered/dashed bullets anywhere
+      3. Imperative sentences as fallback (multi-clause-split)
+
+    On top of whichever extraction path produced criteria, we APPEND implicit
+    constraints — numeric thresholds and structural-refactor directives that
+    aren't shaped like bullets. These flow through the same downstream gates
+    (final-checklist, criteria-nudge, failure-mode diagnosis), turning
+    "must be at least 4 digits" or "extract into a separate module" into
+    checklist items the agent has to address before <final>.
+    """
     if not issue_text:
         return []
+    out: List[str] = []
+    sectioned = _criteria_from_sections(issue_text)
+    if sectioned:
+        out = list(sectioned)
+        # Append implicit constraints to the explicit bullets.
+        for c in _extract_implicit_constraints(issue_text):
+            if c not in out and len(out) < _CRITERIA_MAX_BULLETS:
+                out.append(c)
+        return out
     bullets: List[str] = []
     bullet_re = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+(.+?)\s*$")
     for line in issue_text.splitlines():
@@ -3595,20 +4714,42 @@ def _extract_acceptance_criteria(issue_text: str) -> List[str]:
         if len(bullets) >= _CRITERIA_MAX_BULLETS:
             break
     if bullets:
+        # Append implicit constraints (numeric/structural) to bullet-extracted criteria.
+        for c in _extract_implicit_constraints(issue_text):
+            if c not in bullets and len(bullets) < _CRITERIA_MAX_BULLETS:
+                bullets.append(c)
         return bullets
     fallback_re = re.compile(
-        r"\b(must|should|implement|add|support|ensure|return|raise|expect)\b",
+        r"\b(must|should|implement|add|support|ensure|return|raise|expect|provide|enforce|guarantee)\b",
+        re.IGNORECASE,
+    )
+    clause_split_re = re.compile(
+        r",\s+(?:and\s+|or\s+)?"
+        r"|;\s+"
+        r"|\band\s+(?=(?:also\s+)?(?:must|should|implement|add|support|ensure|return|raise|expect))",
         re.IGNORECASE,
     )
     for raw in re.split(r"(?<=[.!?])\s+", issue_text):
-        text = raw.strip()
-        if not text or len(text) < 12 or len(text) > _CRITERIA_MAX_TEXT:
+        sentence = raw.strip()
+        if not sentence or len(sentence) > _CRITERIA_MAX_TEXT * 3:
             continue
-        if not fallback_re.search(text):
+        if not fallback_re.search(sentence):
             continue
-        bullets.append(text)
-        if len(bullets) >= _CRITERIA_MAX_BULLETS:
-            break
+        for clause in clause_split_re.split(sentence):
+            text = clause.strip().rstrip(".")
+            if len(text) < 12 or len(text) > _CRITERIA_MAX_TEXT:
+                continue
+            bullets.append(text)
+            if len(bullets) >= _CRITERIA_MAX_BULLETS:
+                return bullets
+    # No bullets and no imperative fallback hits — last resort: synthesize
+    # criteria from any implicit numeric/structural constraints in the issue.
+    if not bullets:
+        bullets = _extract_implicit_constraints(issue_text)
+    else:
+        for c in _extract_implicit_constraints(issue_text):
+            if c not in bullets and len(bullets) < _CRITERIA_MAX_BULLETS:
+                bullets.append(c)
     return bullets
 
 
@@ -3620,7 +4761,11 @@ def _criterion_keywords(criterion: str) -> List[str]:
     have zero extracted keywords and the coverage gate returns no signal.
     """
     ascii_tokens = re.findall(r"[A-Za-z][A-Za-z0-9_]{2,}", criterion.lower())
-    cjk_tokens = re.findall(r"[一-鿿]{2,}", criterion)
+    # Extended CJK coverage: BMP CJK ideographs, JP hiragana+katakana, KR hangul.
+    cjk_tokens = re.findall(
+        r"[一-鿿〇々]{2,}|[ぁ-ゟ゠-ヿ]{2,}|[가-힣]{2,}",
+        criterion,
+    )
     return [t for t in ascii_tokens if t not in _CRITERIA_STOP] + cjk_tokens
 
 
@@ -3638,11 +4783,14 @@ _KEYWORD_SUFFIX_STRIPS = (("ing", 4), ("tion", 4), ("ion", 4), ("ed", 4), ("es",
 def _keyword_in_added(keyword: str, added_lower: str) -> bool:
     if keyword in added_lower:
         return True
+    # Try each English suffix in order; do NOT break on the first-suffix-fail.
+    # A word like "boxes" matches both "es" and "s"; the stem "box" only
+    # surfaces from the second strip. The original break swallowed those
+    # legitimate matches and inflated the unaddressed-criteria count.
     for suffix, min_stem_len in _KEYWORD_SUFFIX_STRIPS:
         if keyword.endswith(suffix) and len(keyword) - len(suffix) >= min_stem_len:
             if keyword[:-len(suffix)] in added_lower:
                 return True
-            break
     return False
 
 
@@ -3658,21 +4806,30 @@ def _patch_added_text(patch: str) -> str:
 def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
     """Criteria whose significant tokens DON'T appear in the patch's added
     lines. The judge frequently dings the king for missing N of M criteria;
-    surfacing the gap lets the model close it before <final>."""
+    surfacing the gap lets the model close it before <final>.
+
+    Pure-deletion patches (no `+` lines) are not flagged as missing all
+    criteria — a legitimate 'remove X' task can satisfy its acceptance
+    criteria purely through removals, and the keyword check cannot verify
+    that case. Returning every criterion as unaddressed there falsely
+    blocked ship via the criteria_mostly_unaddressed gate.
+    """
     criteria = _extract_acceptance_criteria(issue_text)
     if not criteria:
         return []
     added_lower = _patch_added_text(patch)
     if not added_lower:
-        return criteria
+        return []
     missing: List[str] = []
     for crit in criteria:
         keywords = _criterion_keywords(crit)
         if not keywords:
             continue
-        # criterion is "addressed" if at least HALF its keywords appear
+        # Long criteria need stricter coverage to avoid partial-match false
+        # positives. Short criteria keep the lenient half-match rule.
         hits = sum(1 for kw in keywords if _keyword_in_added(kw, added_lower))
-        if hits * 2 < len(keywords):
+        threshold = 0.6 if len(keywords) > 6 else 0.5
+        if hits / max(1, len(keywords)) < threshold:
             missing.append(crit)
     return missing
 
@@ -3858,29 +5015,64 @@ _SYMBOL_STOP = {
 }
 
 
+_DOTTED_PATH_RE = re.compile(r"\b([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*){1,4})\b")
+_NAMESPACED_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*){1,4})\b")
+_DECORATOR_RE = re.compile(r"@([a-zA-Z_][a-zA-Z0-9_]{2,40})")
+
+
 def _extract_issue_symbols(issue_text: str, *, max_symbols: int = 12) -> List[str]:
     """Pull identifier-shaped tokens from the issue text.
 
-    Heuristic: any CamelCase or snake_case identifier, plus any all-lowercase
-    identifier of length >=4 (so we catch `pairs`, `solve`, `parse`, etc.).
-    Stop-words and very short tokens are filtered out.
+    Heuristics now cover four token shapes:
+      - CamelCase / snake_case / lowercase ≥4-char identifiers (original)
+      - Dotted module/attribute paths like ``foo.bar.baz`` (Python/JS modules,
+        attribute chains the issue is naming explicitly)
+      - Namespaced names like ``Foo::Bar`` (Rust / Ruby / C++ / Crystal)
+      - Decorator references like ``@cache`` (Python / TS / Java annotations)
+
+    These additional shapes catch identifiers the base regex misses
+    (`from src.utils.helpers import foo` vs the issue mentioning
+    "src.utils.helpers"), and the new tokens flow through `_symbol_grep_hits`
+    so files referencing them get the same +60 path-boost as path mentions.
+
+    Stop-words and very short tokens are filtered as before.
     """
     seen: set = set()
     out: List[str] = []
-    for match in _SYMBOL_RE.finditer(issue_text):
-        token = match.group(1)
-        if token in seen:
-            continue
+
+    def _accept(token: str, *, allow_short: bool = False) -> bool:
+        if not token or token in seen:
+            return False
         lowered = token.lower()
         if lowered in _SYMBOL_STOP:
-            continue
-        is_compound = any(c.isupper() for c in token[1:]) or "_" in token
-        if not is_compound and len(token) < 4:
-            continue
+            return False
+        is_compound = any(c.isupper() for c in token[1:]) or "_" in token or "." in token or "::" in token
+        if not is_compound and not allow_short and len(token) < 4:
+            return False
         seen.add(token)
         out.append(token)
-        if len(out) >= max_symbols:
-            break
+        return True
+
+    # Original single-token identifiers
+    for match in _SYMBOL_RE.finditer(issue_text):
+        if _accept(match.group(1)) and len(out) >= max_symbols:
+            return out
+
+    # Dotted module/attribute paths (`foo.bar.baz`)
+    for match in _DOTTED_PATH_RE.finditer(issue_text):
+        if _accept(match.group(1), allow_short=True) and len(out) >= max_symbols:
+            return out
+
+    # Namespaced names (`Foo::Bar`, `std::sync::Mutex`)
+    for match in _NAMESPACED_RE.finditer(issue_text):
+        if _accept(match.group(1), allow_short=True) and len(out) >= max_symbols:
+            return out
+
+    # Decorator / annotation references (`@cache`, `@deprecated`)
+    for match in _DECORATOR_RE.finditer(issue_text):
+        if _accept(match.group(1)) and len(out) >= max_symbols:
+            return out
+
     return out
 
 
@@ -4776,6 +5968,103 @@ def build_deletion_nudge_prompt(issue_text: str) -> str:
         "Task:\n"
         f"{short}\n"
     )
+
+
+def _diagnose_attempt_failure(
+    patch: str,
+    issue_text: str,
+    repo: Optional[Path],
+    baseline_failing_tests: Optional[List[Tuple[str, str]]] = None,
+) -> List[str]:
+    """Structured failure-mode analysis of an attempt's patch.
+
+    Returns a list of actionable diagnosis strings the next attempt can use
+    to choose a different approach. Generic "ship blockers: X" tells the
+    model WHAT failed; this tells it WHY and HOW to avoid the same miss.
+
+    Diagnosis categories surfaced (when present):
+      - wrong-file       — issue names specific paths the patch never touched
+      - missing-criteria — specific acceptance bullets not addressed
+      - still-failing    — tests that demonstrated the bug still fail post-patch
+      - syntax-broken    — patch introduces syntax errors
+      - scope-creep      — debug scaffolding / TODO comments in added lines
+      - empty-patch      — no substantive content
+      - forbidden-path   — patch touches paths the issue says not to modify
+
+    Each entry is a single short string the model can act on. Empty list
+    means no specific failures detected (attempt was close but didn't ship
+    for some other reason).
+    """
+    out: List[str] = []
+    if not patch.strip():
+        out.append("empty-patch: attempt produced no substantive content — pick a target file by name from the issue and start with an explicit <edit> on it")
+        return out
+
+    # wrong-file: issue mentions paths but the patch ignored them
+    try:
+        uncovered = _uncovered_required_paths(patch, issue_text)
+        if uncovered:
+            paths_str = ", ".join(f"`{p}`" for p in uncovered[:5])
+            out.append(f"wrong-file: issue names these paths but the patch didn't touch them — make {paths_str} part of the edit set on this attempt")
+    except Exception:
+        pass
+
+    # missing-criteria: extracted bullets the patch's added text doesn't cover
+    try:
+        missing = _unaddressed_criteria(patch, issue_text)
+        if missing:
+            bullets = "; ".join(c[:120] for c in missing[:4])
+            out.append(f"missing-criteria: these acceptance items look unaddressed — verify each: {bullets}")
+    except Exception:
+        pass
+
+    # still-failing: tests that demonstrated the bug pre-patch still fail post-patch
+    if repo is not None and baseline_failing_tests:
+        try:
+            still = _verify_baseline_tests_pass(repo, baseline_failing_tests, timeout_seconds=5)
+            if still is not None:
+                node_id, tail = still
+                tail_excerpt = (tail or "").strip().splitlines()
+                tail_str = " | ".join(tail_excerpt[-3:])[:300] if tail_excerpt else ""
+                out.append(f"still-failing: baseline test `{node_id}` still fails after the patch — its failure output is the most direct verification target ({tail_str})")
+        except Exception:
+            pass
+
+    # syntax-broken: patch introduces parser-level errors
+    if repo is not None:
+        try:
+            syntax_errors = _check_syntax(repo, patch)
+            if syntax_errors:
+                err_str = "; ".join(e[:200] for e in syntax_errors[:3])
+                out.append(f"syntax-broken: the patch has syntax errors that need to be fixed first — {err_str}")
+        except Exception:
+            pass
+
+    # scope-creep: debug code or TODO comments left in added lines
+    try:
+        creep = _detect_patch_scope_creep(patch, issue_text)
+        if creep:
+            out.append(f"scope-creep: added lines contain unfinished scaffolding ({', '.join(creep[:3])}) — strip those before the next ship")
+    except Exception:
+        pass
+
+    # forbidden-path: patch touches paths the issue said not to modify
+    try:
+        forbidden_targets = _extract_negative_targets(issue_text)
+        if forbidden_targets:
+            touched = [f.lower() for f in _patch_changed_files(patch)]
+            violations: List[str] = []
+            for forbidden in forbidden_targets:
+                for f in touched:
+                    if forbidden in f:
+                        violations.append(f"`{f}` (issue said do not modify `{forbidden}`)")
+                        break
+            if violations:
+                out.append(f"forbidden-path: patch touches files the issue said NOT to modify — remove edits to {', '.join(violations[:3])}")
+    except Exception:
+        pass
+
+    return out
 
 
 def build_attempt2_bootstrap(result1: Dict[str, Any], n_lines: int) -> str:
@@ -5765,13 +7054,27 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _remaining = _MULTISHOT_TOTAL_BUDGET - _elapsed
         _attempt2_budget = max(30.0, min(70.0, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE - 50.0))
         _bootstrap = build_attempt2_bootstrap(_result1, _n1)
-        _attempt1_blockers = _patch_ship_blockers(_patch1, _issue_text)
-        if _attempt1_blockers:
+        # Replace the generic "ship blockers: X" bootstrap with structured
+        # failure-mode diagnosis when we can pinpoint what went wrong.
+        # The blockers list is still surfaced as a fallback when diagnosis
+        # can't identify anything specific (rare but possible).
+        _attempt1_diagnosis = _diagnose_attempt_failure(
+            _patch1, _issue_text, _multishot_repo_obj
+        )
+        if _attempt1_diagnosis:
             _bootstrap += (
-                "\nAttempt-1 ship blockers to fix on retry: "
-                + ", ".join(_attempt1_blockers)
+                "\nAttempt-1 specific failure modes — act on each one this time:\n"
+                + "\n".join(f"  - {d}" for d in _attempt1_diagnosis[:6])
                 + "\n"
             )
+        else:
+            _attempt1_blockers = _patch_ship_blockers(_patch1, _issue_text)
+            if _attempt1_blockers:
+                _bootstrap += (
+                    "\nAttempt-1 ship blockers to fix on retry: "
+                    + ", ".join(_attempt1_blockers)
+                    + "\n"
+                )
         _attempt1_advisories = _emit_patch_quality_hints(_patch1, _issue_text, _multishot_repo_obj)
         if _attempt1_advisories:
             _bootstrap += (
@@ -5883,6 +7186,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
 
         # Within the largest cluster, pick by score then by line count.
         winner_idx = max(winner_cluster, key=lambda i: (candidates[i][3], candidates[i][4]))
+
         _winner_label, _winner_result, _winner_patch, _winner_score, _winner_n = candidates[winner_idx]
         # Telemetry: flag low-confidence ship for downstream debugging
         if len(winner_cluster) < 2 and len(candidates) >= 2:
@@ -5927,14 +7231,6 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         except NameError:
             started = time.monotonic()
         return _finalize(_maybe_emergency(exc_result, started))
-        # The lines below are unreachable but preserved to minimize diff vs UID 212.
-        _unused = AgentResult(
-            patch=salvaged or "",
-            logs="",
-            steps=0,
-            cost=0.0,
-            success=bool(salvaged.strip()),
-        ).to_dict()
 
 
 def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
@@ -5959,6 +7255,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
     test_fix_turns_used = 0
+    baseline_verify_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     final_checklist_used = 0
@@ -6036,7 +7333,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, final_checklist_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used, destructive_deletion_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, baseline_verify_used, coverage_nudges_used, criteria_nudges_used, final_checklist_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used, destructive_deletion_nudges_used
         patch = get_patch(repo)
 
         # === NEW (P1 #3): Adaptive refinement gating =========================
@@ -6112,6 +7409,49 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_syntax_fix_prompt(syntax_errors),
                     "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+                )
+                return True
+
+        # Baseline-verify gate: re-run the originally-failing tests we surfaced
+        # in the initial prompt. If any still fails, the patch hasn't fixed the
+        # bug the issue actually describes — feed the new failure tail back so
+        # the model can target it directly. Runs at most once per attempt and
+        # only when the pre-solve probe found failing tests to begin with.
+        if (
+            baseline_verify_used < MAX_BASELINE_VERIFY_TURNS
+            and _baseline_failing_tests
+        ):
+            still = _verify_baseline_tests_pass(
+                repo,
+                _baseline_failing_tests,
+                timeout_seconds=_companion_test_timeout_seconds(
+                    command_timeout, time_remaining()
+                ),
+            )
+            # Mark the gate as used regardless of outcome — running the probe
+            # already consumed budget, and if tests passed we don't want to
+            # re-run them on the next refinement check. Only consume the
+            # cross-gate refinement turn when we actually queue a fix turn.
+            baseline_verify_used += 1
+            if still is not None:
+                # Re-check the time floor: the probe just spent up to ~18-24s
+                # of wall-clock that the floor check above couldn't account
+                # for. Without the recheck we can queue a refinement turn
+                # that the loop can't finish before WALL_CLOCK_STOP fires,
+                # shipping a half-formed patch.
+                if time_remaining() < _REFINEMENT_TIME_FLOOR_SECONDS:
+                    logs.append(
+                        "REFINEMENT_TIME_GATED_POST_BASELINE_VERIFY:\n  "
+                        f"remaining={time_remaining():.1f}s "
+                        f"floor={_REFINEMENT_TIME_FLOOR_SECONDS:.1f}s"
+                    )
+                    return False
+                node_id, new_failure = still
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_test_fix_prompt(node_id, new_failure),
+                    f"BASELINE_VERIFY_FAILED:\n  {node_id}",
                 )
                 return True
 
@@ -6326,11 +7666,32 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         repo_summary = get_repo_summary(repo)
         preloaded_context, preloaded_files = build_preloaded_context(repo, issue)
         _tracked_set_for_checks: set = set(_tracked_files(repo))
-        known_test_node_ids = [n for n, _ in _discover_likely_test_nodes(repo, issue, _tracked_set_for_checks)]
+        _likely_tests = _discover_likely_test_nodes(repo, issue, _tracked_set_for_checks)
+        known_test_node_ids = [n for n, _ in _likely_tests]
         logs.append(f"RANKED_TEST_NODES: count={len(known_test_node_ids)}")
+
+        # Pre-solve test probe: run a small set of candidate tests on the
+        # unpatched repo so the model starts from ground-truth bug
+        # demonstrations rather than guessing what to fix from issue text
+        # alone. Time-gated: only fires when ample wall-clock remains so
+        # the probe can't starve the action loop. Best-effort — empty
+        # results just leave the prompt unchanged.
+        _baseline_failing_tests: List[Tuple[str, str]] = []
+        if _likely_tests and time_remaining() > 200.0:
+            _baseline_t0 = time.monotonic()
+            _baseline_failing_tests = _run_failing_tests_baseline(
+                repo, _likely_tests, timeout_seconds=6, max_tests=3
+            )
+            logs.append(
+                "BASELINE_TESTS: "
+                f"checked={min(3, len(_likely_tests))} "
+                f"failing={len(_baseline_failing_tests)} "
+                f"elapsed={time.monotonic() - _baseline_t0:.1f}s"
+            )
 
         _initial_user_content = (
             (prior_attempt_summary if prior_attempt_summary else "")
+            + _format_failing_tests_section(_baseline_failing_tests)
             + build_initial_user_prompt(issue, repo_summary, preloaded_context)
         )
         _acceptance_criteria = _extract_acceptance_criteria(issue)
