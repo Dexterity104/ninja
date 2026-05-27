@@ -2849,6 +2849,63 @@ def _extract_issue_keywords(issue_text: str) -> List[str]:
     return out
 
 
+_ISSUE_TEST_NODE_RE = re.compile(
+    r"([A-Za-z0-9_./-]+\.(?:py|js|jsx|ts|tsx|go|rs|rb|php|java|kt|swift|cc|cpp|cxx|c|h|hpp)"
+    r"::[A-Za-z0-9_.$:/\-\[\] ]{2,160})"
+)
+
+
+def _extract_issue_test_node_ids(
+    issue_text: str,
+    tracked: Optional[set] = None,
+    max_nodes: int = 6,
+) -> List[str]:
+    if not issue_text:
+        return []
+    tracked_set = set(tracked or [])
+    out: List[str] = []
+    seen: set = set()
+
+    def resolve_path(raw_path: str) -> Optional[str]:
+        path = raw_path.strip().strip("./")
+        if not path:
+            return None
+        if not tracked_set:
+            return path
+        if path in tracked_set:
+            return path
+        suffix_matches = [p for p in tracked_set if p.endswith("/" + path)]
+        if len(suffix_matches) == 1:
+            return suffix_matches[0]
+        basename_matches = [p for p in tracked_set if Path(p).name == Path(path).name]
+        if len(basename_matches) == 1:
+            return basename_matches[0]
+        return None
+
+    for m in _ISSUE_TEST_NODE_RE.finditer(issue_text):
+        raw = m.group(1).strip("`'\"()")
+        raw = raw.rstrip(".,;")
+        if "::" not in raw:
+            continue
+        path_part, member = raw.split("::", 1)
+        path = resolve_path(path_part)
+        member = member.strip()
+        if not path or not member:
+            continue
+        if tracked_set and path not in tracked_set:
+            continue
+        if not _context_file_allowed(path):
+            continue
+        node_id = f"{path}::{member}"
+        if node_id in seen:
+            continue
+        seen.add(node_id)
+        out.append(node_id)
+        if len(out) >= max_nodes:
+            break
+    return out
+
+
 def _get_python_function_body(repo: Path, relative_path: str, function_name: str) -> str:
     import ast
 
@@ -2860,9 +2917,13 @@ def _get_python_function_body(repo: Path, relative_path: str, function_name: str
         return ""
 
     class_name = None
-    func_only = function_name
-    if "::" in function_name:
-        class_name, func_only = function_name.split("::", 1)
+    func_only = function_name.strip()
+    if "::" in func_only:
+        class_name, func_only = func_only.split("::", 1)
+        class_name = class_name.strip()
+    if "[" in func_only:
+        func_only = func_only.split("[", 1)[0]
+    func_only = func_only.strip()
 
     target_node = None
     if class_name:
@@ -2988,6 +3049,19 @@ def _discover_likely_test_nodes(
 
     scored: List[Tuple[int, str, str]] = []
 
+    # Honor exact node ids that issue authors paste from failing output.
+    # These are stronger than keyword matches and should be tried first.
+    explicit_nodes = _extract_issue_test_node_ids(issue_text, tracked)
+    for node_id in explicit_nodes:
+        test_path, _, member = node_id.partition("::")
+        body = ""
+        if test_path.endswith(".py") and member:
+            body = _get_python_function_body(repo, test_path, member)
+        if not body:
+            body = _read_context_file(repo, test_path, 1400)
+        if body:
+            scored.append((1000, node_id, body))
+
     # ---- Python ----------------------------------------------------------
     py_files = [
         p for p in tracked
@@ -3007,8 +3081,9 @@ def _discover_likely_test_nodes(
                         score = _score_name(child.name)
                         if score <= 0:
                             continue
-                        node_id = f"{relative_path}::{child.name}"
-                        body = _get_python_function_body(repo, relative_path, child.name)
+                        member = f"{node.name}::{child.name}"
+                        node_id = f"{relative_path}::{member}"
+                        body = _get_python_function_body(repo, relative_path, member)
                         if body:
                             scored.append((score, node_id, body))
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
