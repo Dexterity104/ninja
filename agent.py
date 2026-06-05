@@ -397,6 +397,109 @@ def _repo_path(path: str | Path) -> Path:
 # behavior, response parsing, or model-message strategy here. Keep all requests
 # pointed at the api_base/api_key supplied by solve(); the validator proxy
 # rewrites the model and sampling parameters server-side.
+def _sse_data_from_line(line: str) -> Optional[str]:
+    stripped = line.strip()
+    if not stripped or stripped.startswith(":"):
+        return None
+    if not stripped.startswith("data:"):
+        return None
+    return stripped[len("data:") :].strip()
+
+
+def _read_streaming_chat_completion(resp: Any, model_name: str) -> Dict[str, Any]:
+    content_parts: List[str] = []
+    reasoning_parts: List[str] = []
+    role = "assistant"
+    response_id: Optional[str] = None
+    response_model: Optional[str] = None
+    created: Optional[int] = None
+    finish_reason: Optional[str] = None
+    native_finish_reason: Optional[str] = None
+    usage: Dict[str, Any] = {}
+    saw_event = False
+
+    while True:
+        line_bytes = resp.readline()
+        if not line_bytes:
+            break
+        if isinstance(line_bytes, bytes):
+            line = line_bytes.decode("utf-8", errors="replace")
+        else:
+            line = str(line_bytes)
+        data = _sse_data_from_line(line)
+        if data is None:
+            continue
+        if data == "[DONE]":
+            break
+        saw_event = True
+        try:
+            chunk = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(chunk, dict):
+            continue
+
+        response_id = str(chunk.get("id") or response_id or "")
+        response_model = str(chunk.get("model") or response_model or "")
+        if chunk.get("created") is not None:
+            try:
+                created = int(chunk["created"])
+            except (TypeError, ValueError):
+                pass
+        if isinstance(chunk.get("usage"), dict):
+            usage = chunk["usage"]
+
+        for choice in chunk.get("choices") or []:
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+            message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+            if delta.get("role"):
+                role = str(delta["role"])
+            elif message.get("role"):
+                role = str(message["role"])
+
+            content = delta.get("content", message.get("content"))
+            if isinstance(content, str):
+                content_parts.append(content)
+            reasoning = (
+                delta.get("reasoning")
+                or delta.get("reasoning_content")
+                or message.get("reasoning")
+                or message.get("reasoning_content")
+            )
+            if isinstance(reasoning, str):
+                reasoning_parts.append(reasoning)
+            finish_reason = choice.get("finish_reason") or finish_reason
+            native_finish_reason = choice.get("native_finish_reason") or native_finish_reason
+
+    if not saw_event:
+        raise RuntimeError("streaming model response contained no SSE events")
+
+    payload: Dict[str, Any] = {
+        "id": response_id or f"chatcmpl-stream-{int(time.time() * 1000)}",
+        "object": "chat.completion",
+        "created": created or int(time.time()),
+        "model": response_model or model_name,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": role,
+                    "content": "".join(content_parts),
+                },
+                "finish_reason": finish_reason,
+            }
+        ],
+        "usage": usage,
+    }
+    if native_finish_reason is not None:
+        payload["choices"][0]["native_finish_reason"] = native_finish_reason
+    if reasoning_parts:
+        payload["choices"][0]["message"]["reasoning"] = "".join(reasoning_parts)
+    return payload
+
+
 def chat_completion(
     messages: List[Dict[str, str]],
     model: str,
@@ -420,11 +523,14 @@ def chat_completion(
         "model": model_name,
         "messages": messages,
         "max_tokens": max_tokens,
+        "stream": True,
+        "stream_options": {"include_usage": True},
     }
 
     body = json.dumps(payload).encode("utf-8")
     headers = {
         "Content-Type": "application/json",
+        "Accept": "text/event-stream",
         "Authorization": f"Bearer {key}",
     }
 
@@ -434,8 +540,12 @@ def chat_completion(
         req = urllib.request.Request(url=url, data=body, headers=headers, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                raw = resp.read().decode("utf-8", errors="replace")
-                data = json.loads(raw)
+                content_type = resp.headers.get("Content-Type", "")
+                if "text/event-stream" in content_type.lower():
+                    data = _read_streaming_chat_completion(resp, model_name)
+                else:
+                    raw = resp.read().decode("utf-8", errors="replace")
+                    data = json.loads(raw)
             break
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="replace")
@@ -584,6 +694,7 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
             timeout=timeout,
             executable="/bin/bash",
             env=_command_env(),
+            preexec_fn=os.setsid,
         )
 
         return CommandResult(
@@ -14781,6 +14892,13 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     )
                     break
                 # No patch yet but still time/budget; ride out and try again.
+                if step >= 2 and not get_patch(repo).strip():
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": "The model response was empty or failed. Please try again with a concrete edit command (e.g. sed, python -c, or cat > file) that makes progress on the issue.",
+                        }
+                    )
                 continue
 
             consecutive_model_errors = 0
