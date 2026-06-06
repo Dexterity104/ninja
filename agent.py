@@ -183,7 +183,7 @@ MAX_FINAL_CHECKLIST_NUDGES = 1  # one mandatory pre-final per-requirement verifi
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_DELETION_NUDGES = 1    # surface missing removals when issue says delete/remove but patch has none
 MAX_DESTRUCTIVE_DELETION_NUDGES = 1  # flag large unsolicited -line blocks during additive-only tasks
-MAX_TOTAL_REFINEMENT_TURNS = 3  # ninjaking66 PR#268 insight: chained refinements blow time budget;
+MAX_TOTAL_REFINEMENT_TURNS = 3  # chained refinements blow the time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted).
                                 # Raised 2→3 after fixing multishot timing bug (attempt 2 now has a
                                 # bounded budget so extra turns can't push the process past the docker
@@ -208,7 +208,7 @@ _REFINEMENT_TIME_FLOOR_SECONDS = 32.0   # min remaining seconds to queue any
 _HAIL_MARY_TIME_FLOOR_SECONDS = 18.0    # min remaining seconds for the
                                         # empty-patch hail-mary turn
 
-_STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
+_STYLE_HINT_BUDGET = 600   # cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
 # real history. The validator clones the real repo with full git history; the
@@ -574,7 +574,17 @@ def chat_completion(
         raise RuntimeError(f"Model request failed after retries: {last_error}")
 
     try:
-        content = data["choices"][0]["message"]["content"] or ""
+        _msg = data["choices"][0]["message"]
+        content = _msg.get("content") or ""
+        # Reasoning models (e.g. minimax-m2.x) emit a separate `reasoning_content`
+        # block and can leave `content` EMPTY when the token budget is exhausted by
+        # thinking — observed on short-budget judge/repair calls (max_tokens=700 →
+        # empty content → no verdict). Fall back to the reasoning text so the caller
+        # still gets the model's output instead of "". Only fires when content is
+        # empty, so the normal main-loop path is unchanged.
+        if not content.strip():
+            content = (_msg.get("reasoning_content")
+                       or _msg.get("reasoning") or "") or ""
     except Exception as e:
         raise RuntimeError(f"Unexpected model response shape: {data}") from e
 
@@ -590,7 +600,7 @@ def chat_completion(
 # Sandbox tool preflight (re-adopted from king 5f6194e, which king 419ccb2 dropped):
 # block commands that invoke a tool the sandbox lacks (no network / not installed)
 # BEFORE running them, returning a hint instead of wasting a step on a guaranteed
-# failure. Generalizes the rg-not-in-sandbox / test-runner rabbit-hole (065512)
+# failure. Generalizes the rg-not-in-sandbox / test-runner rabbit-hole
 # defenses at the command layer. Probe is cached per tool; no branch-1 interaction
 # (pure per-command check, no shared mutable budget).
 _SANDBOX_TOOL_PROBE: Dict[str, bool] = {}
@@ -958,8 +968,8 @@ def _command_stuck_in_loop(recent: List[str]) -> bool:
 # Code-file suffixes where an HTML entity like &lt; / &gt; / -&gt; is NEVER the
 # intended literal — it is the model HTML-escaping structural chars (generics,
 # lambdas, JSX) to avoid breaking the <edit> tag parser. We write that escaped
-# text verbatim today, yielding uncompilable code (real duel loss 067366:
-# "HTML entities replace angle brackets and lambdas across every new Java file").
+# text verbatim today, yielding uncompilable code (a real duel loss:
+# HTML entities replaced angle brackets and lambdas across every new Java file).
 # Markup formats (.html/.xml/.svg/.md/.vue/.svelte) are EXCLUDED — there &lt; is
 # a legitimate literal.
 _CODE_ENTITY_SUFFIXES = {
@@ -3296,7 +3306,7 @@ _VENDORED_BASENAME_RE = re.compile(
 )
 # Rank penalty for vendored / third-party files in context selection. They are
 # almost never the task target (measured: 0/419 golden tasks modify a vendored
-# path), yet on big monorepos they FLOOD the preloaded context (task 065547: the
+# path), yet on big monorepos they FLOOD the preloaded context (the
 # target lsdriver/virtual_input.h ranked #0 but ranks 1-14 were all vendored
 # Android-LS/jni capstone/ImGui files, luring the model to wander there). Penalty
 # deprioritizes (not excludes — a strongly-matched vendored file can still
@@ -5271,7 +5281,7 @@ def _removed_symbol_still_referenced_js_ts(repo: Path, patch: str) -> List[str]:
     same-file declarations the patch REMOVED whose name is still referenced in
     the post-patch source. Loss family: a const/function/class is deleted but
     a sibling shorthand-property or call site remains, yielding a `'X' is not
-    defined` / `Cannot find name 'X'` failure (duel 067444-style:
+    defined` / `Cannot find name 'X'` failure (e.g.
     `readSessionMetaCwd` removed, `metaCwd,` shorthand stays).
 
     Conservative gating:
@@ -5356,7 +5366,7 @@ def _removed_symbol_still_referenced_php(repo: Path, patch: str) -> List[str]:
     Causal gate: name MUST be the short class name (after the last `\\` or the
     alias if present), MUST occur post-removal, MUST NOT be re-added on a `+`
     line in the same file (e.g. swap to a fully-qualified namespace use).
-    Duel 067372-style: `use Illuminate\\Http\\Request;` removed but
+    E.g. `use Illuminate\\Http\\Request;` removed but
     `Request $request` parameter remains in `store()`."""
     findings: List[str] = []
     try:
@@ -5468,7 +5478,7 @@ def _check_broken_references(repo: Path, patch: str) -> List[str]:
     # Mirrors the Python analog (_deleted_symbol_still_referenced): a
     # `-export function X` / `-const X =` / `-use Foo\Bar;` removal that the
     # post-patch file still references is a compile/load error. Targets recurring
-    # losses 067444-style (TS shorthand) and PHP `use ...Request;` removed-but-used.
+    # losses (TS shorthand) and PHP `use ...Request;` removed-but-used.
     # NOTE: duplicate-import/redeclaration binding is already enforced here by
     # _broken_refs_js (duplicate-declaration branch), so the standalone
     # _patch_has_probable_duplicate_imports signal is retained but redundant.
@@ -5546,12 +5556,12 @@ def _wrong_path_to_created_module(repo: Path, patch: str) -> List[str]:
     """Wrong-DEPTH relative import whose intended target EXISTS but at a different
     depth than written -> module-not-found. Two cases, both near-zero FP:
 
-      (A) created-file case (loss 067383, original): the patch ITSELF created the
+      (A) created-file case (original): the patch ITSELF created the
           module (e.g. root `lib/supabase-admin.js`) but the added import
           `../../../lib/...` from app/api/admin/create-user/route.js resolves to
           nonexistent `app/lib/...`. High confidence: the file plainly exists.
 
-      (B) pre-existing-file case (loss 067383 variant, lost AGAIN in 006078): the
+      (B) pre-existing-file case (variant): the
           added import `../../../lib/supabase` resolves to nonexistent
           `app/lib/supabase`, but a root `lib/supabase.ts` ALREADY exists (correct
           path was one `../` deeper). Fires only when EXACTLY ONE repo file shares
@@ -6349,7 +6359,7 @@ _GO_SINGLE_IMPORT_RE = re.compile(r"^\s*import\s+(?:([A-Za-z_.]\w*|\.|_)\s+)?\"(
 
 def _unused_go_imports(repo: Path, patch: str) -> List[str]:
     """Go fails to COMPILE on an unused import — and gofmt -e (our only Go check)
-    is parse-only and misses it. The recurring loss (067362): the patch removes
+    is parse-only and misses it. The recurring loss: the patch removes
     the last user of a package but leaves its import, breaking the build.
 
     CAUSAL gate keeps FP near-zero: flag a package only when (a) it has ZERO uses
@@ -6432,7 +6442,7 @@ def _rust_unregistered_module(repo: Path, patch: str) -> List[str]:
     """Cross-file Rust mod-wiring guard. Our rustc check (_check_rust_syntax_one)
     is parse-only PER FILE and cannot see that a newly-created module file was
     never registered with `mod <name>;` in its parent — an unreachable module
-    that makes the WHOLE crate fail to compile (recurring loss 067390 / 067395:
+    that makes the WHOLE crate fail to compile (recurring loss:
     created src/types/hardware.rs but never added `mod hardware;` to mod.rs).
 
     Fires ONLY when the patch CREATES a non-special `.rs` file under `src/` and
@@ -6523,7 +6533,7 @@ def _robots_sitemap_wrong_route(patch: str) -> List[str]:
     """Next.js App Router canonical-path guard. `robots.txt` and `sitemap.xml`
     MUST be served from the domain root (crawlers fetch /robots.txt); a route file
     under `app/api/` serves them at /api/robots.txt and silently fails the spec —
-    a recurring duel loss (067366/067358/067363/067361). Near-0 FP: a robots/
+    a recurring duel loss. Near-0 FP: a robots/
     sitemap route under app/api/ is essentially always wrong; only fires on a
     CHANGED file whose path matches `app/api/<robots.txt|sitemap[.xml]>/route.*`."""
     findings: List[str] = []
@@ -6554,8 +6564,8 @@ _DSIH_SCRIPT_RE = re.compile(
 def _dangerous_inner_html_script(repo: Path, patch: str) -> List[str]:
     """Flag a `dangerouslySetInnerHTML` whose __html string contains a literal
     `<script ...>` tag. Browsers do NOT execute <script> inserted via innerHTML,
-    so GA4/GTM/Pixel injected this way silently never run — a recurring duel loss
-    (067359/067363/067361). Fire only when the patch ADDED a dangerouslySetInnerHTML
+    so GA4/GTM/Pixel injected this way silently never run — a recurring duel
+    loss. Fire only when the patch ADDED a dangerouslySetInnerHTML
     on a JS/TS file AND the post-patch source has `<script` inside that prop's
     object literal. Conservative: scans the braces-balanced object after the prop;
     bails on any parse ambiguity; ≤4 findings."""
@@ -6730,6 +6740,12 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
         lambda: _detect_type_only_import_as_value(repo, patch),
         lambda: _detect_jsx_fragment_imbalance(patch, repo),
         lambda: _detect_php_duplicate_method(repo, patch),
+        # --- loss-analysis correctness ship-blockers (G1/G2/G3/G4/G5) ---
+        lambda: _detect_import_export_kind_mismatch(patch, repo),
+        lambda: _detect_glued_declaration_keyword(patch, repo),
+        lambda: _detect_go_unused_local_var(patch, repo),
+        lambda: _detect_go_code_before_package(patch, repo),
+        lambda: _detect_destructure_from_non_object_hook(patch, repo),
     ):
         try:
             errors.extend(_detector_call())
@@ -7628,10 +7644,10 @@ def _run_companion_test(
 
     Pairs with build_test_fix_prompt — when this returns a non-None failure
     tail, that tail is fed back to the model as one extra refinement turn.
-    Companion-test execution was scaffolded by previous king alexlange1 (the
-    constant MAX_TEST_FIX_TURNS, the helper build_test_fix_prompt, and the
-    co-loading templates _TEST_PARTNER_TEMPLATES) but never wired up; the
-    massive PR #185 rewrite preserved the dead scaffolding without using it.
+    Companion-test execution was scaffolded earlier (the constant
+    MAX_TEST_FIX_TURNS, the helper build_test_fix_prompt, and the co-loading
+    templates _TEST_PARTNER_TEMPLATES) but never wired up; a later large
+    rewrite preserved the dead scaffolding without using it.
     This re-introduces the runtime-correctness signal as a refinement gate.
     """
     full = repo / test_path
@@ -8771,6 +8787,251 @@ def _patch_duel_score(patch: str, issue: str) -> int:
     return score
 
 
+def _parse_judge_verdict(content: str) -> "Tuple[Optional[bool], str]":
+    """Extract a branch-0(A)/branch-1(B) verdict from a judge response.
+
+    Returns (True => floor/A, False => challenger/B, None => undecidable, reason).
+    minimax often skips the instructed `VERDICT: X` line, which made the strict
+    regex return None ("no_verdict_line" — observed in practice), so the judge
+    became a silent no-op. This also accepts looser CONCLUSION phrasings ("Candidate
+    A is better", "prefer B", "A wins"), searched only in the tail (the decision),
+    taking the LAST match. Conservative: genuine ambiguity -> None (caller then
+    falls back to the size pick, never blocking the ship on a guessed verdict)."""
+    text = content or ""
+    hits = re.findall(r"verdict\s*[:\-]?\s*\(?\*{0,2}([ab])\b", text, re.IGNORECASE)
+    if hits:
+        v = hits[-1].upper()
+        return (v == "A", "verdict_" + ("floor" if v == "A" else "challenger"))
+    tail = text[-600:]
+    pats = (
+        r"candidate\s+([ab])\b[^.\n]{0,50}?(?:\bis\b[^.\n]{0,30}?\b(?:better|stronger|"
+        r"superior|preferable|more\b|winner|correct|complete|cleaner|safer)|\bwins\b)",
+        r"\b([ab])\s+is\s+(?:the\s+)?(?:clearly\s+)?(?:better|stronger|superior|"
+        r"preferable|winner|more\s+correct|more\s+complete|cleaner|safer)",
+        r"(?:prefer|choose|select|pick|go\s+with|recommend)\s+(?:candidate\s+)?([ab])\b",
+        r"\b([ab])\s+wins\b",
+    )
+    found: "List[Tuple[int, str]]" = []
+    for p in pats:
+        for m in re.finditer(p, tail, re.IGNORECASE):
+            found.append((m.start(), m.group(1).upper()))
+    if found:
+        found.sort()
+        v = found[-1][1]
+        return (v == "A", "verdict_" + ("floor" if v == "A" else "challenger") + "_loose")
+    return (None, "no_verdict_line")
+
+
+def _llm_judge_prefer_floor(
+    issue_text: str,
+    floor_patch: str,
+    challenger_patch: str,
+    model: Optional[str],
+    api_base: Optional[str],
+    api_key: Optional[str],
+    *,
+    max_tokens: int = 4096,
+    timeout: int = 45,
+    detail: Optional[Dict[str, Any]] = None,
+) -> Optional[bool]:
+    """Conservative LLM-judge tiebreak for the branch-0 vs branch-1 best-of.
+
+    Branch 1 wins best-of by SIZE (`_patch_duel_score`), so it can ship a
+    bigger-but-build-broken patch over a cleaner branch 0 (stray `</div>`
+    + a `res.json()` used without `await`), defects no static gate catches
+    (tsc parses it, the JSX-fragment check only sees `<>`/`</>`, the strict
+    veto sees no parse error).
+
+    Returns True iff the judge says the FLOOR (branch 0) is the better/safer
+    patch (caller KEEPS branch 0); False if branch 1 is at least as good (caller
+    publishes branch 1); None on any error / missing verdict (caller falls back
+    to the size pick — we NEVER block the ship on the judge). Reference-free (no
+    gold), single call; used only to PREVENT a buggy branch-1 override, never to
+    force a worse one."""
+    if detail is None:
+        detail = {}
+    if not floor_patch.strip() or not challenger_patch.strip():
+        detail["reason"] = "empty_input"
+        return None
+    if floor_patch.strip() == challenger_patch.strip():
+        detail["reason"] = "identical_patches"
+        return None
+    try:
+        model_name, base, key = _resolve_inference_config(model, api_base, api_key)
+    except Exception:
+        detail["reason"] = "config_error"
+        return None
+
+    def _trunc(p: str) -> str:
+        return p if len(p) <= 6000 else p[:3800] + "\n...[truncated]...\n" + p[-1800:]
+
+    prompt = (
+        "Two candidate diffs solve the SAME issue. Pick the one an expert code "
+        "reviewer would score higher. A LONGER patch is NOT better if it carries "
+        "defects. Hunt specifically for build-breaking / silently-wrong defects: "
+        "malformed or unbalanced JSX (e.g. an extra `</div>`), a Promise used "
+        "without `await` (e.g. `const x = res.json()` then reading `x.foo`), "
+        "inverted conditionals, wrong API/prop usage vs the issue, references to "
+        "undefined names, scope errors, or destructive removal of working code.\n\n"
+        f"ISSUE:\n{issue_text[:2500]}\n\n"
+        f"CANDIDATE A (current best):\n```diff\n{_trunc(floor_patch)}\n```\n\n"
+        f"CANDIDATE B (alternative):\n```diff\n{_trunc(challenger_patch)}\n```\n\n"
+        "First list the concrete build-breaking / runtime defects in A and in B "
+        "(or 'none' for each). Then decide which is more correct and complete "
+        "overall. End with EXACTLY one line:\nVERDICT: A   or   VERDICT: B"
+    )
+    try:
+        content, _cost, _data = chat_completion(
+            [{"role": "user", "content": prompt}],
+            model=model_name, api_base=base, api_key=key,
+            max_tokens=max_tokens, timeout=timeout,
+        )
+    except Exception as _e:
+        detail["reason"] = "llm_error"
+        detail["error"] = str(_e)[:200]
+        return None
+    detail["raw_tail"] = (content or "")[-300:]
+    _verdict, _reason = _parse_judge_verdict(content or "")
+    detail["reason"] = _reason
+    return _verdict  # True => prefer the floor (branch 0)
+
+
+def _final_defect_repair(
+    issue_text: str,
+    patch: str,
+    stage: str,
+    model: Optional[str],
+    api_base: Optional[str],
+    api_key: Optional[str],
+    *,
+    timeout: int = 45,
+    detail: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """One critique->repair pass on the chosen patch. OPEN-ENDED expert review
+    (not a fixed checklist) against the issue; the model returns its fixes as
+    `<edit>` blocks (the agent's own editor format, fuzzy <old> matching), NOT a
+    unified diff. We apply branch 1's patch + those edits to a scratch tree and
+    let git GENERATE the repaired patch via get_patch — so it is ALWAYS a valid,
+    applicable diff (replaces the old return-a-diff path whose LLM diffs failed to
+    apply: repaired_apply_failed from `@@`/context drift). Adopts ONLY if ≥1 edit
+    applied, non-empty, a net change vs branch 1, within blast-radius, NOT WORSE
+    by `_check_syntax`, and not materially lower `_patch_duel_score`; else None
+    (keep original). Caller still routes through `_publish` (strict veto)."""
+    if detail is None:
+        detail = {}
+    if not patch.strip():
+        detail["reason"] = "empty_input"
+        return None
+    try:
+        model_name, base, key = _resolve_inference_config(model, api_base, api_key)
+    except Exception:
+        detail["reason"] = "config_error"
+        return None
+
+    def _trunc(p: str) -> str:
+        return p if len(p) <= 7000 else p[:4500] + "\n...[truncated]...\n" + p[-2000:]
+
+    prompt = (
+        "You are an expert reviewer. The diff below is one attempt at solving the "
+        "ISSUE. Find the REAL problems in it and FIX them with targeted edits. Do "
+        "NOT limit yourself to a fixed checklist; judge the patch on its own merits "
+        "against this specific issue and codebase. Consider (among anything "
+        "relevant): correctness (does it actually DO what the issue asks? trace the "
+        "logic, data flow, types, edge cases); real APIs (every function/method/"
+        "type/prop/field must actually EXIST and be used with the right signature — "
+        "flag invented or misused APIs); build & runtime (syntax, imports, scope, "
+        "async/await, balanced markup); completeness (the FULL requirement, not just "
+        "the easy part); scope (no destructive removal of working code, no churn).\n\n"
+        "Output your fixes ONLY as <edit> blocks operating on the ALREADY-PATCHED "
+        "files:\n"
+        "  <edit path=\"relative/path\" op=\"replace\"><old>exact snippet to find "
+        "(copy it verbatim, ideally from the patch's added lines)</old><new>corrected "
+        "version</new></edit>\n"
+        "Use op=\"write\" with <content>...</content> only for a small NEW file. "
+        "Make the SMALLEST edits that fix the real problems — do not rewrite working "
+        "code. If after careful review the patch is already correct, output NOTHING.\n\n"
+        f"ISSUE:\n{issue_text[:2200]}\n\n"
+        f"CURRENT PATCH (under review; already applied to the working tree):\n"
+        f"```diff\n{_trunc(patch)}\n```\n\n"
+        "Output ONLY <edit> blocks (or nothing if no fix is needed)."
+    )
+    try:
+        content, _cost, _data = chat_completion(
+            [{"role": "user", "content": prompt}],
+            model=model_name, api_base=base, api_key=key,
+            max_tokens=8192, timeout=timeout,
+        )
+    except Exception as _e:
+        detail["reason"] = "llm_error"
+        detail["error"] = str(_e)[:200]
+        return None
+    edits = extract_edits(content or "")
+    if not edits:
+        detail["reason"] = "no_edits"  # model emitted no <edit> blocks (incl. "already correct")
+        return None
+    # Apply the edits to a scratch tree (base + branch-1 patch + edits) and let git
+    # GENERATE the repaired patch via get_patch — so it is ALWAYS a valid applicable
+    # diff (no `@@`/context drift, hence no repaired_apply_failed). execute_edit is
+    # the agent's own editor (fuzzy <old> matching), reused here.
+    try:
+        sp = Path(stage)
+        if not _stage_patch_in_tree(sp, patch):
+            detail["reason"] = "orig_apply_failed"
+            return None
+        n_orig = len(_check_syntax(sp, patch))
+        applied = 0
+        for ed in edits[:12]:
+            try:
+                if getattr(execute_edit(ed, sp), "exit_code", 1) == 0:
+                    applied += 1
+            except Exception:
+                pass
+        if applied == 0:
+            detail["reason"] = "edits_apply_failed"  # no <edit> matched the patched files
+            return None
+        repaired = get_patch(sp)
+        n_rep = len(_check_syntax(sp, repaired))
+    except Exception:
+        detail["reason"] = "validation_error"
+        return None
+    detail["edits_applied"] = applied
+    if not repaired.strip():
+        detail["reason"] = "empty_result"
+        return None
+    if repaired.strip() == patch.strip():
+        detail["reason"] = "unchanged"  # edits produced no net change vs branch 1
+        return None
+    if abs(len(repaired) - len(patch)) > 0.5 * max(1, len(patch)):
+        detail["reason"] = "blast_radius"
+        detail["size_delta"] = len(repaired) - len(patch)
+        return None
+    if n_rep > n_orig:
+        detail["reason"] = "syntax_worse"
+        detail["n_orig"], detail["n_rep"] = n_orig, n_rep
+        return None
+    # Refuse to adopt a repaired patch that trips the strict ship-blocker (real
+    # parse error, undefined-identifier typo, or a G1-G5 build-break). `sp` still
+    # has `repaired` applied from the edit pass, so this is free. Without it the
+    # repair could "succeed" yet emit a build-broken patch — a fuzzy <edit> that
+    # changes a hook but not its call site, an import/export-kind swap, etc. —
+    # which then ships unless the downstream publish veto happens to catch it.
+    # Adopting only ship-clean repairs makes this pass strictly non-harmful.
+    try:
+        if _branch1_ship_blocked(sp, repaired):
+            detail["reason"] = "repaired_ship_blocked"
+            return None
+    except Exception:
+        pass
+    try:
+        if _patch_duel_score(repaired, issue_text) < _patch_duel_score(patch, issue_text) - 5:
+            detail["reason"] = "score_regressed"
+            return None
+    except Exception:
+        pass
+    detail["reason"] = "adopted"
+    return repaired
+
+
 def _patch_ast_fingerprint(patch: str) -> str:
     """AST-normalized structural fingerprint for Trae-style deduplication."""
     import ast as _ast
@@ -8873,7 +9134,7 @@ def _named_path_coverage_count(patch: str, issue_text: str) -> int:
     Guardrails by construction:
       * counts ONLY files the issue explicitly names (reuses the canonical
         _extract_issue_path_mentions) -> never rewards churn / over-scoping into
-        unnamed files (the 067407 failure mode);
+        unnamed files (a known failure mode);
       * capped at the number of named paths;
       * 0 for all candidates when the issue names <2 paths (single-file tasks)
         -> pure no-op, zero regression risk."""
@@ -10125,7 +10386,7 @@ Error messages are often tested exactly. When changing one, match capitalization
 
 **New-file completeness.** Every NEW file you create MUST contain real implementation code (at minimum three substantive non-trivial lines — not just a stub, `pass`, `// TODO`, or a single import). Creating a file whose body is empty (which git records as the canonical empty blob hash `e69de29`) breaks every importer and is a guaranteed task failure: the validator's referenced-empty-file gate will reject it. If the issue lists multiple new files and your remaining time budget does not allow implementing all of them, IMPLEMENT FEWER FILES COMPLETELY rather than scaffolding many empty stubs. A patch that omits a required file is recoverable; a patch that creates an empty file at an importer's target path is not.
 
-Preserve public API and backwards compatibility unless the issue explicitly requires a breaking change: function/method names, signatures, exported types, CLI flags, config keys, response shapes, error classes, schemas, file formats, env-var names.
+Preserve public API and backwards compatibility unless the issue explicitly requires a breaking change: function/method names, signatures, exported types, CLI flags, config keys, response shapes, error classes, schemas, file formats, env-var names. When the task needs NEW behavior on a function/method that existing callers or tests already depend on, ADD a new overload or a sibling method (keep the old one, delegating to the new one if useful) rather than CHANGING the existing signature in place — adding a parameter or reordering args to an in-use function breaks every current call site and their tests at once. Only change the existing signature when the issue explicitly asks to change that API, and then update EVERY call site in the same patch.
 
 Before finalizing, mentally check hidden-test edge cases relevant to the issue: empty/null input, missing/extra fields, duplicates, case sensitivity, unicode, path separators, async ordering, idempotency, boundary values, default config behavior, multiple instances vs one.
 
@@ -10839,7 +11100,7 @@ def build_gap_edit_prompt(issue_text: str) -> str:
 def build_deletion_nudge_prompt(issue_text: str) -> str:
     """Tell the model it forgot to remove code the issue explicitly requires gone.
 
-    Duel data (round 064855): the issue said remove three old pages; the king
+    Duel data: the issue said remove three old pages; the king
     added the new unified page but left the old pages in place, losing the round.
     The patch had zero deletion lines even though the task demanded removals.
     """
@@ -11123,7 +11384,7 @@ _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
 # Tau docker_solver hard wall is max(per-task-timeout, 300s) from exec start.
 # A 580s outer budget invited "retry" starts with only seconds left, then the
 # process was killed mid-attempt -> empty/partial patch (the catastrophic-floor
-# failure mode observed in duel #4544). Keep outer budget under ~300s.
+# failure mode observed in practice). Keep outer budget under ~300s.
 _MULTISHOT_TOTAL_BUDGET = 278.0
 _MULTISHOT_MIN_ATTEMPT_RESERVE = 52.0
 _COVERAGE_CLOSURE_MIN_REMAINING = 40.0
@@ -11790,7 +12051,7 @@ def _patch_well_formed(patch: str) -> bool:
     file block passes _is_valid_diff_block AND every hunk header's counts match
     its body. A finalize transform that runs AFTER the early hunk-count repair
     can re-break the counts, yielding git's 'corrupt patch at line N' (shipped as
-    a 0-score tie in duel 006026). Used to trigger a fallback to the clean diff.
+    a 0-score tie). Used to trigger a fallback to the clean diff.
     Count semantics mirror _recompute_hunk_header exactly (context = any line not
     +/-/\\)."""
     if not patch.strip():
@@ -11843,6 +12104,25 @@ def _patch_well_formed(patch: str) -> bool:
                 return False
             i = j
     return True
+
+
+def _patch_reverse_applies(repo: Path, patch: str) -> bool:
+    """True if `patch` cleanly REVERSE-applies to repo's working tree — i.e. it
+    IS the tree's current diff, hence a valid, well-structured diff git accepts.
+    Used as an FP guard before VOIDing a patch on `_patch_well_formed` alone:
+    that heuristic has a real false-positive tail (measured ~20% of its
+    flag-and-void cases were valid git diffs), and voiding a valid patch ships
+    empty == 0. Non-destructive (`--check`)."""
+    if not patch.strip():
+        return False
+    try:
+        r = subprocess.run(
+            ["git", "apply", "--check", "--reverse", "--whitespace=nowarn"],
+            cwd=str(repo), input=patch, capture_output=True, text=True, timeout=30,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
 
 
 _STUB_SOURCE_SUFFIXES = {
@@ -13120,6 +13400,7 @@ def _cleanup_branch_copy(path: Optional[str]) -> None:
 # max(timeout, 300)s; if branch 1 runs past it the run still ships branch 0's
 # in-place multishot patch (floor, never 0).
 _BRANCH1_WALL_CEILING = 500.0
+_BRANCH1_HARD_WALL_CEILING = 600.0
 _CHECKPOINT_EXTENSION_SECONDS = 30.0
 _CHECKPOINT_POLL_SECONDS = 5.0
 # --- Atomic primary-tree publish (full extension, zero empty-tree window) ---
@@ -13127,7 +13408,7 @@ _CHECKPOINT_POLL_SECONDS = 5.0
 # hard-killed (at max(task_timeout, 300)s; the timeout is NOT passed to solve()).
 # The in-place swap (git checkout -> clean -> apply) leaves a sub-second window
 # where the tree is EMPTY; a kill there ships an empty patch == solver_error ==
-# 0 that round (the duel 5904 / 4544 catastrophic-floor family). get_patch()
+# 0 that round (the catastrophic-floor family). get_patch()
 # reads "working tree vs index" with HEAD pinned at base, so NO git command can
 # swap the tree near-atomically without either emptying it or staging into the
 # index (both make the diff empty). The only window-free swap is at the
@@ -13210,7 +13491,7 @@ def _branch1_ship_blocked(tree: Path, patch: str) -> bool:
     EXCLUDES the heuristic broken-reference checks in `_check_syntax`
     (duplicate-declaration, missing-React-import, import-resolution) — those
     have known false positives on correct code (verified: they wrongly flag the
-    golden reference patch for task 065176), so vetoing on them would discard
+    golden reference patch), so vetoing on them would discard
     legitimate branch-1 wins. Returns True only when branch 1's patch is almost
     certainly build-broken; branch 0 then stays on the primary tree as floor."""
     try:
@@ -13247,6 +13528,23 @@ def _branch1_ship_blocked(tree: Path, patch: str) -> bool:
                     return True
             except Exception:
                 pass
+    # G5 (measured 0-FP): a destructure of named keys from an in-file function
+    # whose return shape provably cannot supply them — every name is undefined at
+    # runtime (parses fine, names look "declared", so the checks above miss it).
+    try:
+        if _detect_destructure_from_non_object_hook(patch, tree):
+            return True
+    except Exception:
+        pass
+    # Empty REFERENCED new file (measured 0-FP): a new source file created EMPTY
+    # (e69de29) that other patched code imports. It parses clean, so the per-file
+    # checks above miss it, and branch 1 skips _finalize's FILL gate — vetoing
+    # keeps the clean branch-0 floor instead of shipping an empty deliverable.
+    try:
+        if _referenced_empty_new_files(patch):
+            return True
+    except Exception:
+        pass
     return False
 
 
@@ -13260,8 +13558,8 @@ def _atomic_publish(primary: Path, stage: str, patch_text: str) -> bool:
     Fix A (best-of syntax veto): every patch published here is a branch-1
     candidate. Branch 1 bypasses _finalize and wins best-of on size
     (_patch_duel_score), so a bigger-but-build-broken branch-1 patch could
-    displace the clean branch-0 floor and then lose the round (duels 066499 /
-    065557 / 065915). Once staged, run _check_syntax on the staged tree (the
+    displace the clean branch-0 floor and then lose the round (observed
+    in practice). Once staged, run _check_syntax on the staged tree (the
     patch is already applied there, so it is free) and REFUSE the swap if it
     trips a ship-blocker — branch 0 stays on the primary tree as the floor."""
     if not _stage_patch_in_tree(Path(stage), patch_text):
@@ -13375,6 +13673,19 @@ def solve(
     # tracks it so the returned result's patch matches what is physically on disk.
     _disk_patch, _disk_score = _b0patch, _s0
 
+    # Best-of telemetry (attached to the returned result -> visible in solve.json /
+    # the harness round record). Lets you SEE what the repair + judge actually did:
+    #   branch1_size_winner : branch 1 beat branch 0 on _patch_duel_score (entered best-of)
+    #   repair_attempted/adopted : did _final_defect_repair run / change the candidate
+    #   judge_ran : did _llm_judge_prefer_floor get called (vs skipped near the wall)
+    #   judge_verdict : "floor" (kept branch 0) | "challenger" (branch 1) | "none" (no verdict)
+    #   branch1_published : branch 1 (possibly repaired) ultimately shipped over branch 0
+    _bo = {
+        "branch1_size_winner": False, "repair_attempted": False,
+        "repair_adopted": False, "judge_ran": False,
+        "judge_verdict": None, "branch1_published": False,
+    }
+
     # Atomic-publish staging tree on the SAME filesystem as primary, so a new
     # best can be swapped in with ZERO empty-tree window (renameat2 EXCHANGE),
     # safe at ANY time. If staging/syscall is unavailable we fall back to the
@@ -13430,15 +13741,122 @@ def solve(
                     _sc = -1
                 if _sc > _wins:
                     _winp, _wins = _p, _sc
-        # Publish branch 1's winner only if it beats the on-disk patch; the
-        # swap (atomic, or windowed fallback) leaves the current floor in place
-        # on any failure, so the tree is never empty/worse than branch 0.
+        # Authoritative final decision: branch 0 vs the best branch-1 candidate.
+        # Gate on branch 0's ORIGINAL score `_s0`, NOT `_disk_score`: the poll
+        # loop may have already swapped a branch-1 checkpoint onto disk (raising
+        # _disk_score to == _wins), which made the old `_wins > _disk_score` gate
+        # FALSE and silently skipped the judge/repair entirely (case:
+        # branch1_won but best_of all-false). Comparing against _s0 means
+        # the judge/repair run whenever branch 1 is competitive, regardless of
+        # what the poll loop published for kill-safety.
         if (
-            _winp.strip() and _wins > _disk_score
+            _winp.strip() and _wins >= _s0
             and _primary is not None and _init_head
-            and _publish(_winp, _disk_patch)
         ):
-            _disk_patch, _disk_score = _winp, _wins
+            # SWAPPED ORDER (repair -> judge): branch 1 won best-of on SIZE but
+            # (unlike branch 0) skipped _finalize, so it may be bigger-but-buggier.
+            # First REPAIR branch 1 — scrub the JSX/await/inverted-logic class that
+            # static gates miss — THEN let the judge compare branch 0 vs
+            # the REPAIRED branch 1. This salvages branch 1's completeness when its
+            # defects are fixable, instead of discarding it for the smaller clean
+            # branch 0. (Branch 0 already went through _finalize + 7245651a
+            # well-formed hardening, so it is not separately repaired here.)
+            _bo["branch1_size_winner"] = True
+            _cand = _winp
+            try:
+                if _stage and (time.monotonic() - _started) < (_BRANCH1_HARD_WALL_CEILING - 45.0):
+                    _bo["repair_attempted"] = True
+                    _repair_detail: Dict[str, Any] = {}
+                    _rep = _final_defect_repair(
+                        issue, _winp, _stage, model, api_base, api_key,
+                        timeout=int(
+                            max(15.0, min(40.0,
+                                _started + _BRANCH1_HARD_WALL_CEILING - time.monotonic() - 24.0))
+                        ),
+                        detail=_repair_detail,
+                    )
+                    _bo["repair_detail"] = _repair_detail.get("reason")
+                    if _rep and _rep.strip():
+                        _cand = _rep  # the judge now sees the repaired branch 1
+                        _bo["repair_adopted"] = True
+            except Exception:
+                _cand = _winp
+            # Branch-1 deterministic cleanup — parity with branch 0's _finalize,
+            # which branch 1 SKIPS (it is a raw _solve_attempt). Run the SAME
+            # shared patch-text passes (scope-drop, lockfile/sanitize/malformed/
+            # hunk-repair, empty-stub strip, no-model linters) on the candidate.
+            # Guard: only adopt a non-empty result (the strip could empty a
+            # pure-stub patch; branch 1 has no salvage net, so keep _cand then).
+            try:
+                _cleaned_b1, _b1tele = _finalize_patch_text_passes(_cand, issue)
+                if _cleaned_b1.strip() and _cleaned_b1 != _cand:
+                    _cand = _cleaned_b1
+                    if _b1tele:
+                        _bo["branch1_finalize_passes"] = _b1tele
+            except Exception:
+                pass
+            # Low-signal floor override: branch 0 SELF-CERTIFIED WEAK this round.
+            # `multishot_skipped_retry` is set only when branch 0's first attempt
+            # scored < _MULTISHOT_LOW_SIGNAL_THRESHOLD substantive changes (the
+            # agent wanted a retry) but could not afford one. A known-weak floor
+            # must NOT win on the floor-judge's "safer/cleaner-but-smaller"
+            # verdict (observed: a 1-line floor kept over a fuller branch 1). When
+            # the repaired branch-1 candidate is STRICTLY more substantive, trust
+            # the strict static veto (_branch1_ship_blocked, enforced inside
+            # _publish) over the flaky LLM floor-judge: skip the judge and ship
+            # branch 1 if it clears the veto, else the publish no-ops and the
+            # existing floor stays. Deterministic trigger; no new build-break risk.
+            _skip_floor_judge = False
+            if _b0.get("multishot_skipped_retry"):
+                try:
+                    if _multishot_count_substantive(_cand) > _multishot_count_substantive(_b0patch):
+                        _skip_floor_judge = True
+                        _bo["floor_low_signal_override"] = _b0.get("multishot_skipped_retry")
+                except Exception:
+                    _skip_floor_judge = False
+            # Judge: branch 0 (clean floor) vs the (possibly repaired) branch 1.
+            # ONLY a "floor is better" verdict blocks the override; error / None /
+            # no-time falls back to the size pick (publish _cand). Skip near wall.
+            _prefer_floor = False
+            try:
+                if not _skip_floor_judge and (time.monotonic() - _started) < (_BRANCH1_HARD_WALL_CEILING - 22.0):
+                    _bo["judge_ran"] = True
+                    _judge_detail: Dict[str, Any] = {}
+                    # Floor MUST be branch 0's ORIGINAL patch (_b0patch), NOT
+                    # _disk_patch: the poll loop may have already published a
+                    # branch-1 checkpoint to disk, so _disk_patch == _cand
+                    # (branch 1) → the judge saw identical patches and no-op'd
+                    # ("identical_patches", verdict none) on every poll-extended
+                    # round. Compare the real branch 0 vs the branch-1 candidate.
+                    _verdict = _llm_judge_prefer_floor(
+                        issue, _b0patch, _cand, model, api_base, api_key,
+                        timeout=int(
+                            max(15.0, min(45.0,
+                                _started + _BRANCH1_HARD_WALL_CEILING - time.monotonic() - 6.0))
+                        ),
+                        detail=_judge_detail,
+                    )
+                    _bo["judge_detail"] = _judge_detail.get("reason")
+                    _bo["judge_raw_tail"] = _judge_detail.get("raw_tail")
+                    _bo["judge_verdict"] = (
+                        "floor" if _verdict is True
+                        else "challenger" if _verdict is False else "none"
+                    )
+                    _prefer_floor = (_verdict is True)
+            except Exception:
+                _prefer_floor = False
+            if _prefer_floor:
+                # Judge keeps branch 0. If the poll loop already swapped a
+                # branch-1 checkpoint onto disk, restore the clean floor (override
+                # it back to branch 0). If branch 0 is already on disk, nothing to do.
+                if _disk_patch != _b0patch and _b0patch.strip() and _publish(_b0patch, _b0patch):
+                    _disk_patch, _disk_score = _b0patch, _s0
+            elif _cand == _disk_patch:
+                # branch 1 already on disk via the poll loop; judge confirmed it.
+                _bo["branch1_published"] = True
+            elif _publish(_cand, _disk_patch):
+                _disk_patch, _disk_score = _cand, _wins
+                _bo["branch1_published"] = True
     except Exception:
         pass
 
@@ -13447,10 +13865,15 @@ def solve(
         shutil.rmtree(_stage, ignore_errors=True)  # holds swapped-out content, not primary
     # Return the result whose patch matches what is physically on disk.
     if _disk_patch == _b0patch:
+        try:
+            _b0["best_of"] = _bo
+        except Exception:
+            pass
         return _b0
     _winres = dict(_b1.get("result") or {}) or dict(_b0)
     _winres["patch"] = _disk_patch
     _winres["branch1_won"] = True
+    _winres["best_of"] = _bo
     return _winres
 
 
@@ -13683,6 +14106,96 @@ def _run_agentless_pipeline(**kwargs: Any) -> Dict[str, Any]:
         ).to_dict() | {"localization_context": ""}
 
 
+def _finalize_patch_text_passes(patch: str, issue_text: str) -> Tuple[str, Dict[str, Any]]:
+    """Deterministic, patch-text-only finalize passes, shared by branch 0's
+    `_finalize` and the branch-1 best-of path (branch 1 is a raw `_solve_attempt`
+    that bypasses `_finalize`, so without this it skips every cleanup below).
+
+    Pure patch->patch transforms in the SAME order `_finalize` applied them
+    inline — NO model calls and NO repo/tree access. Tree-dependent passes
+    (test-framework / react-namespace import injection, the working-tree
+    patch-validity fallback) deliberately stay in `_finalize`; for branch 1 the
+    strict ship veto covers the build-break case at publish. Returns
+    (cleaned_patch, telemetry); caller merges telemetry into its result/best-of."""
+    tele: Dict[str, Any] = {}
+    if not patch.strip():
+        return patch, tele
+    # S3 MIXED-MODERATE scope-creep DROP: strip off-scope files that contribute
+    # <= _S3_SCOPE_DROP_MAX_RATIO of total added lines (small surgical drops).
+    try:
+        _off_scope = _s3_detect_off_scope_files(patch, issue_text)
+        if _off_scope:
+            _total_added = _count_substantive_added_lines(patch)
+            if _total_added > 0:
+                _off_added = sum(_s3_file_added_lines(patch, p) for p in _off_scope)
+                if _off_added > 0 and (_off_added / _total_added) <= _S3_SCOPE_DROP_MAX_RATIO:
+                    _stripped_off = _s3_drop_off_scope_blocks(patch, _off_scope)
+                    if _stripped_off and _stripped_off != patch:
+                        patch = _stripped_off
+                        tele["s3_off_scope_dropped"] = _off_scope[:6]
+    except Exception:
+        pass
+    stripped = _strip_lockfile_diffs_unless_mentioned(patch, issue_text)
+    if stripped != patch:
+        patch = stripped
+        tele["lockfile_stripped"] = True
+    try:
+        sanitized = _sanitize_patch(patch)
+        if sanitized != patch:
+            patch = sanitized
+            tele["patch_sanitized"] = True
+    except Exception:
+        pass
+    dropped = _drop_malformed_diff_blocks(patch)
+    if dropped != patch:
+        patch = dropped
+        tele["malformed_blocks_dropped"] = True
+    # Repair only after malformed blocks are stripped — hunk-count repair on
+    # garbage diffs can corrupt valid hunks downstream.
+    repaired = _repair_hunk_header_counts(patch)
+    if repaired != patch:
+        patch = repaired
+        tele["hunk_headers_repaired"] = True
+    # Catastrophic-pattern guard: several new files created and a majority empty
+    # -> strip the unreferenced empty ones rather than ship the stub-only blowout.
+    # Referenced empties are left for the FILL gate (stripping breaks the importer).
+    _new_files_count = len(_patch_newly_created_files(patch))
+    if _new_files_count >= _STUB_PATTERN_MIN_NEW_FILES:
+        _ref_empty = set(_referenced_empty_new_file_paths(patch))
+        _empty_paths = [p for p in _empty_new_file_paths(patch) if p not in _ref_empty]
+        if _empty_paths and len(_empty_paths) / max(1, _new_files_count) >= _STUB_PATTERN_EMPTY_FRACTION:
+            _stripped = _strip_empty_new_files_from_patch(patch, _empty_paths)
+            if _stripped != patch:
+                patch = _stripped
+                tele["empty_stub_files_stripped"] = _empty_paths
+    # Post-finalize defect linters (additive, no model calls). Ordered
+    # destructive/structural strips -> deduplication -> constructive/additive
+    # injection, so each pass operates on the already-simplified patch and the
+    # injected directive isn't later stripped/deduped. (Output is order-invariant
+    # on the corpus — the passes touch disjoint regions — so this is for clarity.)
+    for _fn, _key in (
+        # destructive / structural strips first
+        (_strip_binary_artifacts_from_patch, "binary_artifacts_stripped"),
+        (_strip_pure_stub_new_files, "empty_stub_files_dropped"),
+        (_strip_self_imports, "self_imports_dropped"),
+        (_autofix_drop_unsolicited_return_deletion_hunks, "return_deletion_hunks_dropped"),
+        # deduplication next
+        (_dedupe_duplicate_function_decls, "dedup_fn_decls_applied"),
+        (_dedupe_duplicate_imports, "dedup_imports_applied"),
+        # constructive / additive last (injects/modifies strings)
+        (_ensure_use_client_directive, "use_client_prepended"),
+        (_autofix_rust_char_literal_strings, "rust_char_literals_autofixed"),
+    ):
+        try:
+            _m = _fn(patch)
+            if _m != patch and _m.strip():
+                patch = _m
+                tele[_key] = True
+        except Exception:
+            pass
+    return patch, tele
+
+
 def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
     """Multi-shot solve with emergency rescue + lockfile-strip post-process."""
     _issue_for_route = kwargs.get("issue", "") or ""
@@ -13871,7 +14384,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
                 # PATCH-VALIDITY GUARD (must be LAST): transforms above can run
                 # after the early hunk-count repair and re-break counts → git
                 # rejects with 'corrupt patch at line N' and the round is a
-                # 0-score tie (duel 006026). Re-repair counts as the final step,
+                # 0-score tie). Re-repair counts as the final step,
                 # then if the diff is STILL not well-formed, fall back to the
                 # clean working-tree diff (structurally valid by git construction;
                 # the winner patch is already applied to the tree at this point).
@@ -14269,7 +14782,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
 
     except Exception as exc:
         # EXCEPTION-PATH FIX: previously the exception handler returned empty
-        # patch without invoking emergency rescue. Per duel #4956-4958 analysis,
+        # patch without invoking emergency rescue. Per duel analysis,
         # ~3% of rounds hit this path (uncaught exception in _solve_attempt) →
         # chal_score=0.00 catastrophic loss. Salvage the on-disk patch as
         # before, AND fire emergency rescue if patch is still empty + budget
@@ -14328,7 +14841,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     final_review_turns_used = 0
     hail_mary_turns_used = 0
     mid_loop_hail_mary_used = 0
-    total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
+    total_refinement_turns_used = 0  # total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
     must_edit_after_gap = False
     must_edit_patch = ""
@@ -14467,7 +14980,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 return True
             return False
 
-        # ninjaking66 PR#268 cap: chains of 5-7 refinements blow time budget.
+        # cap: chains of 5-7 refinements blow the time budget.
         # Hard-stop if we've already used the cap (hail-mary doesn't count).
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
@@ -14681,7 +15194,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             # If every surfaced baseline failure is a non-runnable tooling/env
             # error (no TS loader, missing dep, no network), "make these tests
             # pass" is the wrong framing — it makes the model rabbit-hole on the
-            # test runner and never implement the issue (real loss: task 065512,
+            # test runner and never implement the issue (a real-loss case,
             # ~all steps on vitest.config for ERR_UNKNOWN_FILE_EXTENSION, zero
             # features). Drop them so they are neither surfaced nor refined, and
             # tell the model to implement the issue directly.
@@ -15833,7 +16346,7 @@ def _detect_unsolicited_return_block_deletion(patch: str) -> List[str]:
     lines (the hunk is INSIDE an unchanged function), but its body is now
     gone — the function silently returns undefined at runtime.
 
-    The Section.tsx failure shape (bench-20260601-143220-2): hunk strips
+    The Section.tsx failure shape: hunk strips
     `-  return (` + JSX body + `-  );` while adding only `+` (a blank line).
     The function signature is in `+/ ` context lines but its return is gone.
 
@@ -18012,6 +18525,583 @@ def _detect_php_duplicate_method(repo: Path, patch: str) -> List[str]:
     except Exception:
         return out[:6]
     return out[:6]
+
+
+# -----------------------------------------------------------------------------
+# Three correctness ship-blockers from a duel loss-analysis: the agent kept
+# losing rounds on build-breaking code the existing gates could not see (the
+# sandbox has no node/tsc/go toolchain):
+#   G1 _detect_import_export_kind_mismatch  -> default-vs-named import/export
+#       swap (`import { X }` of a module that only `export default`s X -> X is
+#       undefined at runtime -> non-functional).
+#   G2 _detect_glued_declaration_keyword    -> a splice that ate a space, gluing
+#       a declaration keyword to its identifier (`constallues = [`).
+#   G3 _detect_go_unused_local_var          -> a function-local `var x T` that is
+#       never read (Go HARD compile error, not a warning).
+# Each is tightened for near-zero false positives (closed syntactic contradiction
+# or hapax/scope-counted) so a healthy patch is never bounced for a refinement.
+# -----------------------------------------------------------------------------
+
+def _js_module_export_shape(source: str) -> "Dict[str, Any]":
+    """Parse a JS/TS module's ESM export surface.
+
+    Returns {has_default: bool, default_name: Optional[str], named: set[str],
+    has_star: bool}. `named` holds the OUTWARD-facing names (`export { a as B }`
+    contributes B). `export { default as X }` adds X to named; `export { default }`
+    / `export default ...` set has_default. Best-effort, line-based, never raises.
+    """
+    has_default = False
+    default_name: Optional[str] = None
+    named: set = set()
+    has_star = False
+    for ln in source.splitlines():
+        s = ln.strip()
+        if not s.startswith("export"):
+            continue
+        if re.match(r"export\s+default\b", s):
+            has_default = True
+            m = re.match(
+                r"export\s+default\s+(?:async\s+)?(?:function\s*\*?\s*|class\s+)([A-Za-z_$][\w$]*)",
+                s,
+            )
+            if m:
+                default_name = m.group(1)
+            continue
+        # `export * from '...'` (and `export * as ns from`) — names unknown.
+        if re.match(r"export\s+\*", s):
+            has_star = True
+            continue
+        # `export { a, b as C, default as D }` (optionally `... from '...'`)
+        mb = re.match(r"export\s+(?:type\s+)?\{([^}]*)\}", s)
+        if mb:
+            for part in mb.group(1).split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                # `a as B` -> outward name B; else the bare name.
+                am = re.match(r"(?:type\s+)?[\w$]+\s+as\s+([\w$]+)", part)
+                nm = am.group(1) if am else re.sub(r"^type\s+", "", part)
+                if nm == "default":
+                    has_default = True
+                else:
+                    named.add(nm)
+            continue
+        # `export const/let/var/function/class/interface/type/enum NAME`
+        md = re.match(
+            r"export\s+(?:async\s+)?(?:const|let|var|function\s*\*?|class|interface|type|enum)\s+([A-Za-z_$][\w$]*)",
+            s,
+        )
+        if md:
+            named.add(md.group(1))
+    return {
+        "has_default": has_default,
+        "default_name": default_name,
+        "named": named,
+        "has_star": has_star,
+    }
+
+
+def _parse_js_import_clause(clause: str) -> "Dict[str, Any]":
+    """Parse the binding clause of an `import <clause> from '...'` statement.
+
+    Returns {default: Optional[str], named: list[str], namespace: bool,
+    type_only: bool}. `named` holds the LOCAL/source names imported in `{ ... }`
+    (`{ a as b }` -> source name a). Type-only entries are dropped; a fully
+    type-only import sets type_only=True.
+    """
+    clause = clause.strip()
+    type_only = False
+    if clause.startswith("type "):
+        type_only = True
+        clause = clause[5:].strip()
+    namespace = False
+    default_name: Optional[str] = None
+    named: List[str] = []
+    # namespace import: `* as ns`
+    if re.search(r"\*\s+as\s+[\w$]+", clause):
+        namespace = True
+    # named block
+    mb = re.search(r"\{([^}]*)\}", clause)
+    if mb:
+        for part in mb.group(1).split(","):
+            part = part.strip()
+            if not part or part.startswith("type "):
+                continue
+            # `a as b` -> source name a
+            am = re.match(r"([\w$]+)\s+as\s+[\w$]+", part)
+            named.append(am.group(1) if am else part)
+        # default name is whatever precedes the '{'
+        head = clause[: mb.start()].rstrip().rstrip(",").strip()
+        if head and re.match(r"^[A-Za-z_$][\w$]*$", head):
+            default_name = head
+    elif not namespace:
+        # `import Default from '...'`
+        if re.match(r"^[A-Za-z_$][\w$]*$", clause):
+            default_name = clause
+    return {"default": default_name, "named": named, "namespace": namespace, "type_only": type_only}
+
+
+_JS_IMPORT_LINE_RE = re.compile(r"""^\s*import\s+(?P<clause>[^'"]*?)\s+from\s+['"](?P<mod>[^'"]+)['"]""")
+
+
+def _detect_import_export_kind_mismatch(patch: str, repo: Optional[Path]) -> List[str]:
+    """G1: a JS/TS import whose default-vs-named KIND contradicts the resolved
+    module's actual exports — the import binding is `undefined` at runtime.
+
+    Two airtight shapes (both observed in real duel losses):
+      (a) `import { X } from M` where M `export default`s X (or only has a
+          default export and no named exports) and has NO named export X.
+      (b) `import D from M` where M has NO default export but DOES have named
+          exports — the default binding resolves to undefined.
+
+    Resolution: relative specifiers via `_resolve_js_relative_module`; aliased/
+    path specifiers (`@/components/Foo`) via UNIQUE basename match against the
+    files this patch creates or the repo tracks. Fires only when the target
+    module is resolvable to exactly one real file AND the contradiction is
+    definite (`export *` re-exports bail out). Reads the post-patch file on disk.
+    """
+    if repo is None or not patch.strip():
+        return []
+    try:
+        tracked = list(_tracked_files(repo))
+    except Exception:
+        tracked = []
+    try:
+        new_files = list(_patch_newly_created_files(patch))
+    except Exception:
+        new_files = []
+    # basename(stem) -> [repo-relative paths] for unique-basename alias resolution
+    stem_index: Dict[str, List[str]] = {}
+    for p in set(tracked) | set(new_files):
+        if p.endswith(tuple(_JS_TS_SUFFIXES)):
+            stem_index.setdefault(Path(p).stem, []).append(p)
+    repo_resolved = repo.resolve()
+    findings: List[str] = []
+    current_file = ""
+    is_js = False
+    for raw in patch.splitlines():
+        if raw.startswith("+++ "):
+            current_file = raw[6:].strip() if raw.startswith("+++ b/") else raw[4:].strip()
+            is_js = current_file.endswith(_JS_LIKE_EXTS)
+            continue
+        if not is_js or not raw.startswith("+") or raw.startswith("+++"):
+            continue
+        body = raw[1:]
+        m = _JS_IMPORT_LINE_RE.match(body)
+        if not m:
+            continue
+        clause = _parse_js_import_clause(m.group("clause"))
+        if clause["type_only"] or clause["namespace"]:
+            continue
+        if not clause["default"] and not clause["named"]:
+            continue
+        mod = m.group("mod")
+        target: Optional[Path] = None
+        if mod.startswith("."):
+            try:
+                target = _resolve_js_relative_module(repo, (repo / current_file).resolve(), mod)
+            except Exception:
+                target = None
+        elif "/" in mod:
+            seg = mod.rstrip("/").rsplit("/", 1)[-1]
+            if seg and seg != "index":
+                hits = stem_index.get(seg) or []
+                if len(hits) == 1:
+                    target = (repo / hits[0]).resolve()
+        if target is None:
+            continue
+        try:
+            target.relative_to(repo_resolved)
+        except Exception:
+            continue
+        if not target.is_file():
+            continue
+        try:
+            shape = _js_module_export_shape(target.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            continue
+        if shape["has_star"]:
+            continue
+        rel_t = str(target.relative_to(repo_resolved))
+        # (a) named import of a default-only / default-named symbol
+        for n in clause["named"]:
+            if n in shape["named"]:
+                continue
+            if shape["has_default"] and (n == shape["default_name"] or not shape["named"]):
+                findings.append(
+                    f"import_export_mismatch: `{current_file}` does `import {{ {n} }} from "
+                    f"'{mod}'` but `{rel_t}` exports {n} as a DEFAULT export, not a named one — "
+                    f"the named import resolves to undefined. Use `import {n} from '{mod}'`."
+                )
+                break
+        # (b) default import of a named-only module
+        d = clause["default"]
+        if d and not shape["has_default"] and shape["named"]:
+            findings.append(
+                f"import_export_mismatch: `{current_file}` does `import {d} from '{mod}'` but "
+                f"`{rel_t}` has NO default export (only named: {', '.join(sorted(shape['named'])[:4])}) — "
+                f"the default import is undefined. Use a named import `import {{ ... }} from '{mod}'`."
+            )
+        if len(findings) >= 4:
+            break
+    return findings[:4]
+
+
+def _detect_glued_declaration_keyword(patch: str, repo: Optional[Path]) -> List[str]:
+    """G2: an added JS/TS line where a `const`/`let`/`var` keyword is glued to
+    its identifier with no space (`constallues = [`), a splice/merge artifact
+    that yields an assignment to an undeclared name (ReferenceError in module
+    strict mode) — node --check parses it fine, so nothing else catches it.
+
+    FP guard: fire only when the glued token is a HAPAX — it occurs exactly once
+    in the whole post-patch file (a genuine typo never recurs; a real variable
+    named e.g. `constants` is declared and used, so it appears 2+ times).
+    """
+    if repo is None or not patch.strip():
+        return []
+    # Capture the keyword + glued tail, and require >=1 space around '=' so
+    # JSX/HTML attributes (`variant="contained"`, no space) can never match --
+    # that was the lone golden false positive. The genuine splice artifact keeps
+    # the original `<name> = <value>` spacing.
+    glue_re = re.compile(r"^\s*(const|let|var)([A-Za-z_$][\w$]*)\s+=\s")
+    # Common real identifiers that begin with a declaration keyword -- never a typo.
+    _glue_denylist = frozenset({
+        "variant", "variants", "variance", "variable", "variables", "various",
+        "varying", "varies", "varargs", "constant", "constants", "constraint",
+        "constraints", "constructor", "letter", "letters", "lettable", "letting",
+    })
+    findings: List[str] = []
+    current_file = ""
+    is_js = False
+    seen_file_cache: Dict[str, Optional[str]] = {}
+    for raw in patch.splitlines():
+        if raw.startswith("+++ "):
+            current_file = raw[6:].strip() if raw.startswith("+++ b/") else raw[4:].strip()
+            is_js = current_file.endswith(_JS_LIKE_EXTS)
+            continue
+        if not is_js or not raw.startswith("+") or raw.startswith("+++"):
+            continue
+        kw_m = glue_re.match(raw[1:])
+        if not kw_m:
+            continue
+        token = kw_m.group(1) + kw_m.group(2)
+        if token in _glue_denylist:
+            continue
+        if current_file not in seen_file_cache:
+            try:
+                seen_file_cache[current_file] = (repo / current_file).read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except Exception:
+                seen_file_cache[current_file] = None
+        src = seen_file_cache[current_file]
+        if src is None:
+            continue
+        if len(re.findall(r"\b" + re.escape(token) + r"\b", src)) != 1:
+            continue
+        findings.append(
+            f"glued_decl_keyword: `{current_file}` has `{token} = ...` — a declaration "
+            f"keyword fused to its name (likely a dropped space). It assigns to an "
+            f"undeclared identifier. Did you mean `{kw_m.group(1)} {kw_m.group(2)} = ...`?"
+        )
+        if len(findings) >= 3:
+            break
+    return findings[:3]
+
+
+def _go_enclosing_func_span(lines: List[str], idx: int) -> Optional["Tuple[int, int]"]:
+    """Return (header_idx, end_idx) of the top-level `func` enclosing line `idx`,
+    by brace counting from the nearest preceding column-0 `func`. None if the
+    line is not inside a function body (package-level vars are not unused-errors).
+    """
+    header = None
+    for i in range(idx, -1, -1):
+        if re.match(r"^func\b", lines[i]):
+            header = i
+            break
+    if header is None:
+        return None
+    depth = 0
+    started = False
+    for j in range(header, len(lines)):
+        depth += lines[j].count("{") - lines[j].count("}")
+        if "{" in lines[j]:
+            started = True
+        if started and depth <= 0:
+            if idx <= j:
+                return (header, j)
+            return None
+    return None
+
+
+def _detect_go_unused_local_var(patch: str, repo: Optional[Path]) -> List[str]:
+    """G3: a function-local `var name Type` (no initializer) that is never read
+    in its enclosing function — a HARD Go compile error ("declared and not used"),
+    which the sandbox's gofmt-only parser cannot see.
+
+    Scope-correct: counts `name` occurrences strictly within the enclosing
+    top-level func span (Go allows the same local name in other funcs, so a
+    whole-file count would miss a var that is re-declared in a sibling func).
+    Fires only on ADDED declaration lines; skips `_`, multi-name and grouped
+    `var (...)` blocks, and package-level vars.
+    """
+    if repo is None or not patch.strip():
+        return []
+    try:
+        added = _added_newfile_linenos_by_file(patch)
+    except Exception:
+        return []
+    decl_re = re.compile(r"^\s*var\s+([A-Za-z_]\w*)\s+[A-Za-z_\[\]\*\.\{\}][\w\.\*\[\]\{\}\s]*$")
+    findings: List[str] = []
+    for rel in _patch_changed_files(patch):
+        if Path(rel).suffix.lower() != ".go":
+            continue
+        added_lines = added.get(rel) or set()
+        if not added_lines:
+            continue
+        full = (repo / rel).resolve()
+        try:
+            full.relative_to(repo.resolve())
+        except (ValueError, RuntimeError):
+            continue
+        if not full.exists():
+            continue
+        try:
+            lines = full.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            continue
+        for ln_no in sorted(added_lines):
+            idx = ln_no - 1
+            if idx < 0 or idx >= len(lines):
+                continue
+            m = decl_re.match(lines[idx])
+            if not m:
+                continue
+            name = m.group(1)
+            if name == "_":
+                continue
+            span = _go_enclosing_func_span(lines, idx)
+            if span is None:
+                continue
+            body = "\n".join(lines[span[0]: span[1] + 1])
+            if len(re.findall(r"\b" + re.escape(name) + r"\b", body)) == 1:
+                findings.append(
+                    f"go_unused_local_var: {rel}: local `var {name}` is declared but never "
+                    f"used in its function — Go fails to compile with \"declared and not used\". "
+                    f"Remove it or use `_ = {name}`."
+                )
+                if len(findings) >= 5:
+                    return findings
+    return findings[:5]
+
+
+def _detect_go_code_before_package(patch: str, repo: Optional[Path]) -> List[str]:
+    """G4: a .go file whose first significant line is not the `package` clause.
+
+    Go requires `package X` to precede every declaration — only comments, blank
+    lines, and `//go:build` / `// +build` constraint lines may appear before it.
+    A patch that splices a func/var/type/import above the package line makes the
+    whole file uncompilable ("expected 'package', found ..."). The sandbox has no
+    Go toolchain, so nothing else catches it; this is a near-zero-FP check because
+    every compilable Go file starts with the package clause.
+    """
+    if repo is None or not patch.strip():
+        return []
+    findings: List[str] = []
+    for rel in _patch_changed_files(patch):
+        if Path(rel).suffix.lower() != ".go":
+            continue
+        full = (repo / rel).resolve()
+        try:
+            full.relative_to(repo.resolve())
+        except (ValueError, RuntimeError):
+            continue
+        if not full.exists():
+            continue
+        try:
+            lines = full.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            continue
+        first_sig: Optional[str] = None
+        in_block = False
+        for ln in lines:
+            s = ln.strip()
+            if not s:
+                continue
+            if in_block:
+                if "*/" in s:
+                    in_block = False
+                    after = s.split("*/", 1)[1].strip()
+                    if after:
+                        first_sig = after
+                        break
+                continue
+            if s.startswith("//"):  # line comment or //go:build / // +build tag
+                continue
+            if s.startswith("/*"):
+                if "*/" in s:
+                    after = s.split("*/", 1)[1].strip()
+                    if after:
+                        first_sig = after
+                        break
+                    continue
+                in_block = True
+                continue
+            first_sig = s
+            break
+        if first_sig is not None and not first_sig.startswith("package"):
+            findings.append(
+                f"go_code_before_package: {rel}: the first non-comment line is "
+                f"`{first_sig[:50]}` — Go requires the `package` declaration before any "
+                f"code, so this file will not compile. Move the package clause to the top."
+            )
+            if len(findings) >= 5:
+                break
+    return findings[:5]
+
+
+def _js_func_body(source: str, name: str) -> Optional[str]:
+    """Return the `{...}` body (inner text) of the first in-file definition of
+    function/hook `name` — `function name(...) {…}` or `const name = (...) => {…}`.
+    Skips the parameter list (so destructured params don't confuse brace
+    matching) and bails on expression-bodied arrows / non-function bindings.
+    None when no such definition exists. Stdlib only, never raises."""
+    for kw_pat in (
+        r"\bfunction\s+" + re.escape(name) + r"\b",
+        r"\b(?:const|let|var)\s+" + re.escape(name) + r"\s*=",
+    ):
+        for m in re.finditer(kw_pat, source):
+            i, n, pdepth = m.end(), len(source), 0
+            while i < n:
+                c = source[i]
+                if c == "(":
+                    pdepth += 1
+                elif c == ")":
+                    pdepth -= 1
+                elif c == "{" and pdepth == 0:
+                    depth = 0
+                    for j in range(i, n):
+                        cj = source[j]
+                        if cj == "{":
+                            depth += 1
+                        elif cj == "}":
+                            depth -= 1
+                            if depth == 0:
+                                return source[i + 1:j]
+                    return None
+                elif c == ";" and pdepth == 0:
+                    break  # binding with no function body (e.g. `const x = y;`)
+                i += 1
+    return None
+
+
+def _js_return_is_provably_non_object(body: str) -> bool:
+    """True when a function body PROVABLY returns a non-object — so destructuring
+    object keys from its result yields undefined for every key. Fires only when
+    EVERY value-return is a boolean/number/string/null literal or a bare
+    identifier bound by `useState(<primitive>)`, and NONE is (or might be) an
+    object. Any return it cannot classify (object literal, member access,
+    ternary, unresolved identifier, spread, …) makes it return False — the gate
+    never fires on uncertainty. Multi-line object returns are caught by the
+    `r.startswith("{")` object signal, which forces False. Stdlib only."""
+    rets = [r.strip() for r in re.findall(r"\breturn\s+([^;\n]+)", body) if r.strip()]
+    if not rets:
+        return False
+    has_nonobj = False
+    for r in rets:
+        if r.startswith("{") or r.startswith("({"):
+            return False  # an object (or partial multi-line object) is in play
+        if re.match(r"(?:true|false|null|undefined|-?\d|['\"`!])", r):
+            has_nonobj = True
+            continue
+        idm = re.match(r"([A-Za-z_$][\w$]*)$", r)
+        if not idm:
+            return False  # member access / call / ternary / etc — cannot prove
+        um = re.search(
+            r"\[\s*" + re.escape(idm.group(1)) + r"\b[^\]]*\]\s*=\s*useState\s*\(([^)]*)\)",
+            body,
+        )
+        if not um:
+            return False  # identifier we cannot resolve to a primitive
+        init = um.group(1).strip()
+        if init and not re.match(r"(?:true|false|null|undefined|-?\d|['\"`])", init):
+            return False  # useState(<object/array/expr>) — could be destructurable
+        has_nonobj = True
+    return has_nonobj
+
+
+_JS_DESTRUCTURE_CALL_RE = re.compile(
+    r"(?:const|let|var)\s*\{([^}{]*)\}\s*=\s*([A-Za-z_$][\w$]*)\s*\("
+)
+
+
+def _detect_destructure_from_non_object_hook(patch: str, repo: Optional[Path]) -> List[str]:
+    """G5: `const { a, b } = FN(...)` where the IN-FILE function/hook `FN`
+    provably returns a NON-object — every destructured name is `undefined` at
+    runtime. Parses fine and the names are "declared" by the pattern, so neither
+    the syntax check nor the undeclared-identifier gate sees it; yet it silently
+    breaks the component (observed: a `useImagePreloader` hook that `return`s a
+    boolean was destructured as an object, so the gate condition was always
+    undefined and the app never rendered).
+
+    Near-zero FP: fires ONLY when FN is defined in the same file AND its return
+    is provably a non-object (see `_js_return_is_provably_non_object`). Anything
+    it cannot prove → skipped. Gated on the destructure appearing in the patch's
+    ADDED lines."""
+    if repo is None or not patch.strip():
+        return []
+    # Collect added '+' lines per JS/TS file.
+    added_text: Dict[str, str] = {}
+    current = ""
+    is_js = False
+    for raw in patch.splitlines():
+        if raw.startswith("+++ "):
+            current = raw[6:].strip() if raw.startswith("+++ b/") else raw[4:].strip()
+            is_js = current.endswith(_JS_LIKE_EXTS)
+            continue
+        if is_js and raw.startswith("+") and not raw.startswith("+++"):
+            added_text[current] = added_text.get(current, "") + raw[1:] + "\n"
+    findings: List[str] = []
+    repo_resolved = repo.resolve()
+    for rel, atext in added_text.items():
+        if "}" not in atext or "=" not in atext:
+            continue
+        full = (repo / rel).resolve()
+        try:
+            full.relative_to(repo_resolved)
+        except (ValueError, RuntimeError):
+            continue
+        if not full.is_file():
+            continue
+        try:
+            source = full.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for m in _JS_DESTRUCTURE_CALL_RE.finditer(atext):
+            keys = []
+            for part in m.group(1).split(","):
+                part = part.strip()
+                if not part or part.startswith("..."):
+                    continue
+                km = re.match(r"([A-Za-z_$][\w$]*)", part)
+                if km:
+                    keys.append(km.group(1))
+            fn = m.group(2)
+            if not keys or fn in ("useState", "useRef", "useReducer", "useContext", "useMemo"):
+                continue
+            body = _js_func_body(source, fn)
+            if body is None:
+                continue  # FN not defined in this file → cannot prove → skip
+            if _js_return_is_provably_non_object(body):
+                findings.append(
+                    f"destructure_nonobject: {rel}: `{{ {', '.join(keys)} }} = {fn}(...)` "
+                    f"destructures an object, but `{fn}` returns a non-object value — every "
+                    f"name is undefined at runtime. Return an object with those keys, or bind "
+                    f"the single returned value directly (e.g. `const x = {fn}(...)`)."
+                )
+            if len(findings) >= 5:
+                return findings
+    return findings[:5]
 
 
 def _check_python_runtime_one(repo: Path, relative_path: str) -> Optional[str]:
