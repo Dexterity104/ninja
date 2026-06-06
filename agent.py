@@ -925,16 +925,25 @@ def extract_actions_in_order(model_text: str) -> List[Tuple[str, Any]]:
     document order. Returns list of (kind, value) tuples where kind is
     'command' (value=str) or 'edit' (value=dict).
     """
-    out: List[Tuple[int, str, Any]] = []
+    out: List[Tuple[int, int, str, Any]] = []
+    seq = 0
     for m in ACTION_RE.finditer(model_text):
         cmd = (m.group(1) or "").strip()
         if cmd:
-            out.append((m.start(), "command", cmd))
+            out.append((m.start(), seq, "command", cmd))
+            seq += 1
+    search_from = 0
     for ed in extract_edits(model_text):
-        idx = model_text.find(ed["raw"])
-        out.append((idx if idx >= 0 else 0, "edit", ed))
-    out.sort(key=lambda t: t[0])
-    return [(kind, value) for _, kind, value in out]
+        raw = ed.get("raw") or ""
+        idx = model_text.find(raw, search_from) if raw else -1
+        if idx < 0 and raw:
+            idx = model_text.find(raw)
+        if idx >= 0 and raw:
+            search_from = idx + len(raw)
+        out.append((idx if idx >= 0 else len(model_text) + seq, seq, "edit", ed))
+        seq += 1
+    out.sort(key=lambda t: (t[0], t[1]))
+    return [(kind, value) for _, _, kind, value in out]
 
 
 def extract_final(model_text: str) -> Optional[str]:
@@ -986,11 +995,16 @@ def _maybe_unescape_code_entities(text: str, rel: str) -> str:
     for content with no structural entities."""
     if not text or Path(rel).suffix.lower() not in _CODE_ENTITY_SUFFIXES:
         return text
-    if "&lt;" not in text and "&gt;" not in text:
+    structural_entities = ("&lt;", "&gt;", "&#60;", "&#62;", "&#x3c;", "&#x3e;", "&#X3C;", "&#X3E;")
+    if not any(tok in text for tok in structural_entities):
         return text
     try:
         import html as _html
-        return _html.unescape(text)
+        once = _html.unescape(text)
+        if once != text and any(tok in once for tok in structural_entities):
+            twice = _html.unescape(once)
+            return twice
+        return once
     except Exception:
         return text
 
@@ -1008,7 +1022,8 @@ def _strip_wrapping_code_fence(text: str, rel: str) -> str:
     fully fence-wrapped or contains an interior fence (ambiguous)."""
     if not text or Path(rel).suffix.lower() in _NO_FENCE_STRIP_SUFFIXES:
         return text
-    lines = text.split("\n")
+    normalized = text.replace("\r\n", "\n")
+    lines = normalized.split("\n")
     first = 0
     while first < len(lines) and lines[first].strip() == "":
         first += 1
@@ -1019,8 +1034,11 @@ def _strip_wrapping_code_fence(text: str, rel: str) -> str:
         return text
     if _FENCE_OPEN_RE.match(lines[first]) and _FENCE_CLOSE_RE.match(lines[last]):
         inner = lines[first + 1:last]
-        if not any(_FENCE_CLOSE_RE.match(ln) for ln in inner):
-            return "\n".join(inner)
+        if not any(_FENCE_CLOSE_RE.match(ln) or _FENCE_OPEN_RE.match(ln) for ln in inner):
+            stripped = "\n".join(inner)
+            if text.endswith("\r\n"):
+                return stripped.replace("\n", "\r\n")
+            return stripped
     return text
 
 
@@ -1079,21 +1097,39 @@ def execute_edit(edit: Dict[str, Any], repo: Path) -> CommandResult:
                     "Replace requires <old>. To create a new file or overwrite, "
                     "use op=\"write\" with <content>."
                 )
-            if old in src:
-                count = src.count(old)
-                if count > 1:
-                    return _err(
-                        f"Found {count} occurrences of old text in {rel}; "
-                        "must be unique. Please provide more context to make it unique."
-                    )
-                out = src.replace(old, new, 1)
-                if out == src:
-                    return _err(
-                        f"No changes made to {rel}. Replacement produced identical content."
-                    )
-                fp.write_text(out)
-                return _ok(f"Replaced 1 occurrence in {rel} ({len(src)} -> {len(out)} bytes)")
-            located = _fuzzy_locate(src, old)
+            candidates = [old]
+            old_stripped = old.strip("\n\r")
+            if old_stripped and old_stripped != old:
+                candidates.append(old_stripped)
+            seen_candidates = set()
+            ordered_candidates = []
+            for candidate in candidates:
+                if candidate not in seen_candidates:
+                    seen_candidates.add(candidate)
+                    ordered_candidates.append(candidate)
+            for candidate in ordered_candidates:
+                if candidate in src:
+                    count = src.count(candidate)
+                    if count > 1:
+                        return _err(
+                            f"Found {count} occurrences of old text in {rel}; "
+                            "must be unique. Please provide more context to make it unique."
+                        )
+                    out = src.replace(candidate, new, 1)
+                    if out == src:
+                        return _err(
+                            f"No changes made to {rel}. Replacement produced identical content."
+                        )
+                    fp.write_text(out)
+                    suffix = "" if candidate == old else " after trimming surrounding newlines"
+                    return _ok(f"Replaced 1 occurrence in {rel}{suffix} ({len(src)} -> {len(out)} bytes)")
+            located = None
+            used_candidate = old
+            for candidate in ordered_candidates:
+                located = _fuzzy_locate(src, candidate)
+                if located is not None:
+                    used_candidate = candidate
+                    break
             if located is None:
                 return _err(
                     f"Could not find the exact text in {rel}. Old text must "
@@ -1106,9 +1142,10 @@ def execute_edit(edit: Dict[str, Any], repo: Path) -> CommandResult:
                     f"No changes made to {rel}. Replacement produced identical content."
                 )
             fp.write_text(out)
+            suffix = "" if used_candidate == old else " after trimming surrounding newlines"
             return _ok(
                 f"Replaced 1 occurrence in {rel} via whitespace/quote-"
-                f"normalized match ({len(src)} -> {len(out)} bytes). "
+                f"normalized match{suffix} ({len(src)} -> {len(out)} bytes). "
                 "Verify the change."
             )
         if op == "insert":
