@@ -862,11 +862,81 @@ def extract_edits(model_text: str) -> List[Dict[str, Any]]:
     ordering."""
     out: List[Dict[str, Any]] = []
 
+    def _unwrap_body(body: str) -> str:
+        if not body:
+            return body
+        prev = None
+        cur = body
+        for _ in range(3):
+            if cur == prev:
+                break
+            prev = cur
+            cur = _strip_wrapping_code_fence(cur, "x.py")
+        return cur
+
+    def _extract_blocks(body: str) -> Dict[str, str]:
+        text = body or ""
+        blocks: Dict[str, str] = {}
+        for candidate in (text, _unwrap_body(text)):
+            blocks = {}
+            for b in _EDIT_BLOCK_RE.finditer(candidate):
+                blocks[b.group(1).lower()] = b.group(2)
+            if blocks:
+                return blocks
+        text = _unwrap_body(text)
+        tag_names = ("content", "new", "old")
+        for name in tag_names:
+            open_pat = re.compile(r"<" + name + r">", re.IGNORECASE)
+            close_pat = re.compile(r"</" + name + r">", re.IGNORECASE)
+            m_open = open_pat.search(text)
+            if not m_open:
+                continue
+            m_close = close_pat.search(text, m_open.end())
+            if m_close:
+                blocks[name] = text[m_open.end():m_close.start()]
+                continue
+            fragment = text[m_open.end():]
+            next_tag = re.search(r"<(?:/)?(?:content|new|old)>", fragment, re.IGNORECASE)
+            if next_tag:
+                blocks[name] = fragment[:next_tag.start()]
+            elif any(re.search(r"</" + other + r">", fragment, re.IGNORECASE) for other in tag_names):
+                blocks[name] = fragment
+        if blocks:
+            if "content" in blocks:
+                content_value = blocks["content"]
+                wrapped_blocks: Dict[str, str] = {}
+                for b in _EDIT_BLOCK_RE.finditer(_unwrap_body(content_value)):
+                    wrapped_blocks[b.group(1).lower()] = b.group(2)
+                if wrapped_blocks and ("old" in wrapped_blocks or "new" in wrapped_blocks):
+                    for key, value in wrapped_blocks.items():
+                        if key not in blocks or not blocks[key].strip():
+                            blocks[key] = value
+                    if ("old" in wrapped_blocks or "new" in wrapped_blocks) and not blocks["content"].strip():
+                        blocks.pop("content", None)
+            return blocks
+        lowered = text.lower()
+        if "<content>" not in lowered and "<new>" not in lowered and "<old>" not in lowered:
+            stripped = text.strip()
+            if stripped:
+                return {"content": stripped}
+        return blocks
+
+    def _normalize_payload(value: str, path: str) -> str:
+        if not value:
+            return value
+        out_value = value
+        prev = None
+        for _ in range(3):
+            if out_value == prev:
+                break
+            prev = out_value
+            out_value = _strip_wrapping_code_fence(out_value, path or "x.py")
+        out_value = _maybe_unescape_code_entities(out_value, path or "x.py")
+        return out_value
+
     def _mk(attr_str: str, body: str, raw: str) -> Dict[str, Any]:
         attrs = _parse_edit_attrs(attr_str)
-        blocks: Dict[str, str] = {}
-        for b in _EDIT_BLOCK_RE.finditer(body or ""):
-            blocks[b.group(1).lower()] = b.group(2)
+        blocks = _extract_blocks(body)
         try:
             line_arg = int(attrs.get("line", "0") or 0)
         except ValueError:
@@ -876,22 +946,27 @@ def extract_edits(model_text: str) -> List[Dict[str, Any]]:
         except ValueError:
             count_arg = 1
         op = (attrs.get("op") or "replace").lower()
+        path = attrs.get("path", "")
         content = blocks.get("content", "")
         new = blocks.get("new", "")
         old = blocks.get("old", "")
-        # Wrong-block recovery: a write/insert whose payload the model put in the
-        # WRONG tag (<new>/<old> instead of <content>) would otherwise silently
-        # write an EMPTY file — a whole deliverable missing (the dominant
-        # incompleteness loss). Adopt the populated block. Gated to content empty
-        # AND another block carrying text, so it never overrides an intentional
-        # empty file (all blocks empty) or a replace's intentional empty <new>.
         if op in ("write", "insert") and not content.strip():
             if new.strip():
                 content = new
             elif old.strip():
                 content = old
+        if op == "replace":
+            if not old.strip() and content.strip():
+                old = content
+            if not new and content:
+                new = content
+        if op == "delete" and not old.strip() and content.strip():
+            old = content
+        content = _normalize_payload(content, path)
+        new = _normalize_payload(new, path)
+        old = _normalize_payload(old, path)
         return {
-            "path": attrs.get("path", ""),
+            "path": path,
             "op": op,
             "line": line_arg,
             "count": count_arg,
@@ -932,14 +1007,39 @@ def extract_actions_in_order(model_text: str) -> List[Tuple[str, Any]]:
         if cmd:
             out.append((m.start(), seq, "command", cmd))
             seq += 1
+    used_edit_spans: List[Tuple[int, int]] = []
     search_from = 0
     for ed in extract_edits(model_text):
         raw = ed.get("raw") or ""
         idx = model_text.find(raw, search_from) if raw else -1
+        raw_len = len(raw)
+        while idx >= 0 and any(not (idx + max(raw_len, 1) <= s or idx >= e) for s, e in used_edit_spans):
+            idx = model_text.find(raw, idx + 1) if raw else -1
         if idx < 0 and raw:
             idx = model_text.find(raw)
-        if idx >= 0 and raw:
-            search_from = idx + len(raw)
+            while idx >= 0 and any(not (idx + max(raw_len, 1) <= s or idx >= e) for s, e in used_edit_spans):
+                idx = model_text.find(raw, idx + 1)
+        if idx < 0:
+            path = ed.get("path") or ""
+            op = ed.get("op") or ""
+            if path and op:
+                opener_re = re.compile(
+                    r"<edit\b(?=[^>]*\bpath\s*=\s*(['\"])" + re.escape(path) + r"\1)(?=[^>]*\bop\s*=\s*(['\"])" + re.escape(op) + r"\2)[^>]*>",
+                    re.IGNORECASE,
+                )
+                m = opener_re.search(model_text, search_from)
+                while m is not None and any(not (m.start() + 1 <= s or m.start() >= e) for s, e in used_edit_spans):
+                    m = opener_re.search(model_text, m.start() + 1)
+                if m is None:
+                    m = opener_re.search(model_text)
+                    while m is not None and any(not (m.start() + 1 <= s or m.start() >= e) for s, e in used_edit_spans):
+                        m = opener_re.search(model_text, m.start() + 1)
+                if m is not None:
+                    idx = m.start()
+                    raw_len = raw_len or 1
+        if idx >= 0:
+            used_edit_spans.append((idx, idx + max(raw_len, 1)))
+            search_from = idx + max(raw_len, 1)
         out.append((idx if idx >= 0 else len(model_text) + seq, seq, "edit", ed))
         seq += 1
     out.sort(key=lambda t: (t[0], t[1]))
@@ -1066,6 +1166,27 @@ def execute_edit(edit: Dict[str, Any], repo: Path) -> CommandResult:
             command=raw_cmd, stdout="", stderr=stderr,
             exit_code=1, duration_sec=time.monotonic() - t0, timed_out=False,
         )
+    def _normalize_value(value: str) -> str:
+        if not value:
+            return value
+        out_value = _maybe_unescape_code_entities(value, rel)
+        prev = None
+        for _ in range(3):
+            if out_value == prev:
+                break
+            prev = out_value
+            out_value = _strip_wrapping_code_fence(out_value, rel)
+        return out_value
+    def _candidate_texts(value: str) -> List[str]:
+        candidates: List[str] = []
+        for candidate in (
+            value,
+            value.strip("\n\r"),
+            value.strip(),
+        ):
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+        return candidates
     rel = (edit.get("path") or "").lstrip("/")
     if not rel or ".." in Path(rel).parts:
         return _err(f"Invalid path: {edit.get('path')!r}")
@@ -1076,10 +1197,7 @@ def execute_edit(edit: Dict[str, Any], repo: Path) -> CommandResult:
     # still matches the real (unescaped) file content.
     for _k in ("content", "new", "old"):
         if edit.get(_k):
-            edit[_k] = _maybe_unescape_code_entities(edit[_k], rel)
-    for _k in ("content", "new"):
-        if edit.get(_k):
-            edit[_k] = _strip_wrapping_code_fence(edit[_k], rel)
+            edit[_k] = _normalize_value(edit[_k])
     try:
         if op == "write":
             content = edit.get("content") or ""
@@ -1092,21 +1210,20 @@ def execute_edit(edit: Dict[str, Any], repo: Path) -> CommandResult:
         if op == "replace":
             old = edit.get("old") or ""
             new = edit.get("new") or ""
+            if not old and edit.get("content"):
+                old = edit.get("content") or ""
+            if not new and edit.get("content") and old != (edit.get("content") or ""):
+                new = edit.get("content") or ""
             if not old:
                 return _err(
                     "Replace requires <old>. To create a new file or overwrite, "
                     "use op=\"write\" with <content>."
                 )
-            candidates = [old]
-            old_stripped = old.strip("\n\r")
-            if old_stripped and old_stripped != old:
-                candidates.append(old_stripped)
-            seen_candidates = set()
-            ordered_candidates = []
-            for candidate in candidates:
-                if candidate not in seen_candidates:
-                    seen_candidates.add(candidate)
-                    ordered_candidates.append(candidate)
+            if new == old:
+                return _err(
+                    f"No changes made to {rel}. Replacement old and new text are identical."
+                )
+            ordered_candidates = _candidate_texts(old)
             for candidate in ordered_candidates:
                 if candidate in src:
                     count = src.count(candidate)
@@ -1121,28 +1238,33 @@ def execute_edit(edit: Dict[str, Any], repo: Path) -> CommandResult:
                             f"No changes made to {rel}. Replacement produced identical content."
                         )
                     fp.write_text(out)
-                    suffix = "" if candidate == old else " after trimming surrounding newlines"
+                    suffix = "" if candidate == old else " after trimming surrounding whitespace"
                     return _ok(f"Replaced 1 occurrence in {rel}{suffix} ({len(src)} -> {len(out)} bytes)")
-            located = None
+            fuzzy_matches: List[Tuple[Tuple[int, int], str]] = []
             used_candidate = old
             for candidate in ordered_candidates:
                 located = _fuzzy_locate(src, candidate)
                 if located is not None:
-                    used_candidate = candidate
-                    break
-            if located is None:
+                    fuzzy_matches.append((located, candidate))
+            if not fuzzy_matches:
                 return _err(
                     f"Could not find the exact text in {rel}. Old text must "
                     "match including all whitespace and newlines."
                 )
-            s, e = located
+            unique_spans = {match[0] for match in fuzzy_matches}
+            if len(unique_spans) != 1:
+                return _err(
+                    f"Found multiple possible normalized matches for old text in {rel}; "
+                    "please provide more exact context."
+                )
+            (s, e), used_candidate = fuzzy_matches[0]
             out = src[:s] + new + src[e:]
             if out == src:
                 return _err(
                     f"No changes made to {rel}. Replacement produced identical content."
                 )
             fp.write_text(out)
-            suffix = "" if used_candidate == old else " after trimming surrounding newlines"
+            suffix = "" if used_candidate == old else " after trimming surrounding whitespace"
             return _ok(
                 f"Replaced 1 occurrence in {rel} via whitespace/quote-"
                 f"normalized match{suffix} ({len(src)} -> {len(out)} bytes). "
@@ -1166,19 +1288,46 @@ def execute_edit(edit: Dict[str, Any], repo: Path) -> CommandResult:
             return _ok(f"Inserted {len(new_lines)} line(s) at line {insert_at} in {rel}")
         if op == "delete":
             old = edit.get("old") or ""
+            if not old and edit.get("content"):
+                old = edit.get("content") or ""
             if old:
-                if src.count(old) > 1:
-                    return _err(
-                        f"Found {src.count(old)} occurrences of old text in "
-                        f"{rel}; must be unique. Provide more context."
+                ordered_candidates = _candidate_texts(old)
+                for candidate in ordered_candidates:
+                    if candidate in src:
+                        count_found = src.count(candidate)
+                        if count_found > 1:
+                            return _err(
+                                f"Found {count_found} occurrences of old text in "
+                                f"{rel}; must be unique. Provide more context."
+                            )
+                        out = src.replace(candidate, "", 1)
+                        fp.write_text(out)
+                        suffix = "" if candidate == old else " after trimming surrounding whitespace"
+                        return _ok(f"Deleted 1 occurrence from {rel}{suffix} ({len(src)} -> {len(out)} bytes)")
+                fuzzy_matches: List[Tuple[Tuple[int, int], str]] = []
+                used_candidate = old
+                for candidate in ordered_candidates:
+                    located = _fuzzy_locate(src, candidate)
+                    if located is not None:
+                        fuzzy_matches.append((located, candidate))
+                if fuzzy_matches:
+                    unique_spans = {match[0] for match in fuzzy_matches}
+                    if len(unique_spans) != 1:
+                        return _err(
+                            f"Found multiple possible normalized matches for delete text in {rel}; "
+                            "please provide more exact context."
+                        )
+                    (s, e), used_candidate = fuzzy_matches[0]
+                    out = src[:s] + src[e:]
+                    fp.write_text(out)
+                    suffix = "" if used_candidate == old else " after trimming surrounding whitespace"
+                    return _ok(
+                        f"Deleted 1 occurrence from {rel} via whitespace/quote-"
+                        f"normalized match{suffix} ({len(src)} -> {len(out)} bytes). Verify the change."
                     )
-                if old not in src:
-                    return _err(
-                        f"Could not find the exact text to delete in {rel}."
-                    )
-                out = src.replace(old, "", 1)
-                fp.write_text(out)
-                return _ok(f"Deleted 1 occurrence from {rel} ({len(src)} -> {len(out)} bytes)")
+                return _err(
+                    f"Could not find the exact text to delete in {rel}."
+                )
             line = edit.get("line", 0)
             count = edit.get("count", 1)
             if line <= 0 or count <= 0:
