@@ -2,6 +2,7 @@
 observation back, finish when the agent echoes the completion sentinel.
 Uses a text-based action format."""
 
+import json
 import re
 import time
 from dataclasses import dataclass, field
@@ -18,7 +19,37 @@ from .prompts import (
 from .repo_diff import collect_repo_patch
 
 _ACTION_BLOCK_RE = re.compile(r"```(?:bash|sh)?\s*\n(.*?)\n?```", re.DOTALL)
+# Some tool-trained models (e.g. Moonshot Kimi) ignore the bash-block contract
+# and emit their native tool-call tokens as plain text instead. Recognise that
+# format too and pull the shell command out of the JSON argument payload.
+_NATIVE_TOOL_CALL_RE = re.compile(
+    r"<\|tool_call_begin\|>(?P<name>.*?)<\|tool_call_argument_begin\|>(?P<args>.*?)<\|tool_call_end\|>",
+    re.DOTALL,
+)
 _MAX_FORMAT_RETRIES = 3
+
+
+def _extract_commands(reply: str) -> list:
+    """Return shell commands from either the bash-block or native tool-call format."""
+    commands = [action.strip() for action in _ACTION_BLOCK_RE.findall(reply) if action.strip()]
+    if commands:
+        return commands
+    for match in _NATIVE_TOOL_CALL_RE.finditer(reply):
+        try:
+            args = json.loads(match.group("args").strip())
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(args, dict):
+            continue
+        command = (
+            args.get("command")
+            or args.get("cmd")
+            or args.get("code")
+            or args.get("code_string")
+        )
+        if isinstance(command, str) and command.strip():
+            commands.append(command.strip())
+    return commands
 
 
 @dataclass
@@ -79,8 +110,7 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
         messages.append({"role": "assistant", "content": reply})
         log_lines.append(f"[step {step}] assistant:\n{reply}")
 
-        actions = _ACTION_BLOCK_RE.findall(reply)
-        commands = [action.strip() for action in actions if action.strip()]
+        commands = _extract_commands(reply)
         if len(commands) != 1:
             format_retries += 1
             if format_retries > _MAX_FORMAT_RETRIES:
