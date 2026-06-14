@@ -88,10 +88,14 @@ class ChatModel:
         content = message.get("content") if isinstance(message, dict) else None
         if isinstance(content, list):
             content = "".join(
-                str(part.get("text") or "") for part in content if isinstance(part, dict)
+                str(part.get("text") or part.get("content") or "")
+                for part in content
+                if isinstance(part, dict)
             )
         if not isinstance(content, str):
             raise ModelQueryError(f"model response has no text content: {raw[:300]}")
+        if not content.strip():
+            raise ModelQueryError(f"model response has empty text content: {raw[:300]}")
         return content
 
 
