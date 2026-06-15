@@ -31,6 +31,8 @@ sampling).
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 import time
 import traceback
 from typing import Any, Dict, Optional, Tuple
@@ -158,11 +160,84 @@ def _py_syntax_errors(repo_dir: str, patch_text: str) -> list:
     return broken
 
 
+# Non-Python syntax check, TOOLCHAIN-ONLY. The king's repair gate runs compile()
+# on .py only, so the polyglot pool ships compile-fatal patches unscored. We
+# extend it to JavaScript using `node --check` WHEN node is present in the
+# sandbox. We deliberately do NOT add a stdlib bracket-balance fallback: it
+# cannot see duplicate-definition errors (a real failure mode) and false-
+# positives on regex / template-literal / minified code, which would fire
+# needless re-solves and RAISE our retest variance. No tool present -> no opinion
+# -> identical to the king's baseline. node is the only polyglot toolchain
+# reliably present in the network-isolated sandbox, so we scope this to .js.
+#
+# JSX HARD GUARD (variance-safety): `node --check` is a plain V8 parser and
+# CANNOT parse JSX/Flow. The live pool is JS/TS/React-dominant (~31% of rounds
+# touch React/JSX), so a perfectly VALID React patch trips node in two ways:
+#   (1) a .jsx extension -> ERR_UNKNOWN_FILE_EXTENSION (always, regardless of
+#       validity) -> we EXCLUDE .jsx from the gate entirely; and
+#   (2) JSX/Flow inside a .js file -> SyntaxError "Unexpected token '<'" (a
+#       parser artifact, not a real syntax bug) -> we SKIP files whose error is
+#       that artifact (see _js_syntax_errors). Both make node's verdict a false
+#       'broken' on good code, which would fire a needless repair re-solve =
+#       exactly the variance/latency injection the thesis forbids. After these
+#       guards, the gate only flags GENUINELY broken plain JS and degrades to a
+#       no-op everywhere else, so it can only reduce variance, never add it.
+_JS_EXTS = (".js", ".mjs", ".cjs")
+
+# stderr substrings that mean node refused for a NON-syntax-bug reason (JSX/Flow
+# or unknown extension), i.e. a false positive we must NOT treat as broken.
+_JS_FALSE_POSITIVE_MARKERS = (
+    "ERR_UNKNOWN_FILE_EXTENSION",
+    "Unexpected token '<'",
+)
+
+
+def _changed_js_files(patch_text: str) -> list:
+    paths = []
+    for line in patch_text.splitlines():
+        if line.startswith("+++ b/"):
+            rel = line[len("+++ b/"):].strip()
+            if rel.endswith(_JS_EXTS) and rel not in paths:
+                paths.append(rel)
+    return paths
+
+
+def _js_syntax_errors(repo_dir: str, patch_text: str) -> list:
+    """Changed .js files that fail `node --check` (toolchain verdict, no heuristic).
+    Returns [] when node is absent so the gate degrades to the king's baseline."""
+    if shutil.which("node") is None:
+        return []
+    broken = []
+    for rel in _changed_js_files(patch_text):
+        full = os.path.join(repo_dir, rel)
+        if not os.path.isfile(full):
+            continue
+        try:
+            res = subprocess.run(
+                ["node", "--check", full],
+                cwd=repo_dir, capture_output=True, text=True,
+                timeout=15, encoding="utf-8", errors="replace", check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if res.returncode != 0:
+            stderr = res.stderr or ""
+            # Skip node's JSX/Flow/unknown-extension false positives: these are
+            # parser limitations on VALID React/Flow code, not real syntax bugs.
+            # Acting on them would re-roll a good patch (variance injection).
+            if any(marker in stderr for marker in _JS_FALSE_POSITIVE_MARKERS):
+                continue
+            broken.append(f"{rel}: JavaScript syntax error")
+    return broken
+
+
 def _repair_reason(repo_dir: str, patch_text: str) -> Optional[str]:
     """Deterministic signal that the emitted patch is empty or broken, else None."""
     if not (patch_text or "").strip():
         return "the current change set is empty; no fix was produced yet"
     broken = _py_syntax_errors(repo_dir, patch_text)
+    if not broken:
+        broken = _js_syntax_errors(repo_dir, patch_text)
     if broken:
         return "the edited files contain syntax errors that must be fixed:\n- " + "\n- ".join(broken[:8])
     return None
@@ -239,6 +314,7 @@ def solve(
                 if (
                     repaired.patch.strip()
                     and not _py_syntax_errors(repo_path, repaired.patch)
+                    and not _js_syntax_errors(repo_path, repaired.patch)
                 ):
                     outcome = repaired
                     repair_note = " (repair pass adopted)"
