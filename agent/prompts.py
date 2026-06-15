@@ -90,6 +90,29 @@ EOF
 
 - Confirm every requirement is handled before finishing; a fix that covers the
   whole task and proves itself correct beats one that stops early.
+
+## Additional workflow (after step 2)
+
+- Classify the task: **data/config update** (edit named JSON/YAML/CSV/config files only),
+  **refactor/move** (preserve all behavior while relocating code), or **feature/fix**
+  (code + wiring + tests). Do not refactor source when the task only asks to update data.
+- When the task spans multiple files (code + routes + tests + config + UI callers),
+  update **all** of them — not just the obvious source file.
+- For new UI modules, read a sibling component and mirror its prop/callback API and
+  parent wiring style.
+- Before introducing new symbols, grep for the closest analogous existing name and
+  follow that convention.
+
+## Additional hard rules
+
+- Never ship an empty diff or chmod-only change.
+- Refactor/move tasks: relocate logic in place — never delete working code and replace
+  with stubs, empty files, or truncated rewrites.
+- Edit sources directly — no `fix_*.py`, `modify_*.py`, `replace_*.py`, `*.bak`, or
+  helper scripts that rewrite other files.
+- Do not rename props/callbacks to generic idioms when sibling files use a different
+  local pattern.
+- When the task lists specific pages, routes, or config files, confirm each is updated.
 - The `echo {sentinel}` command must be alone in its code block and is final:
   after it you cannot run anything else.
 """

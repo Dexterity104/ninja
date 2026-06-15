@@ -2,7 +2,7 @@
 """
 Multi-file SWE coding agent for the tau subnet.
 
-Contract (unchanged from the public single-file base agent):
+Validator contract:
     The validator imports this file and calls:
 
         solve(
@@ -17,11 +17,13 @@ Contract (unchanged from the public single-file base agent):
 
 Layout:
     agent.py             validator-owned contract + thin solve() wiring
-    agent/prompts.py     system/instance templates for complete, verified fixes
+    agent/prompts.py     system and task prompt templates
     agent/model.py       stdlib OpenAI-compatible chat client with retries
     agent/environment.py fresh-subshell bash executor
     agent/agent_loop.py  the query -> act -> observe step loop
     agent/repo_diff.py   harness-compatible patch collection
+    agent/criteria.py    acceptance checklist from issue bullets
+    agent/guards.py      patch quality signals for repair gate
 
 All inference uses only the validator-provided api_base/api_key; there are no
 third-party dependencies and no sampling overrides (the validator proxy owns
@@ -40,6 +42,8 @@ from typing import Any, Dict, Optional, Tuple
 from agent.agent_loop import AgentRunConfig, run_agent_loop
 from agent.prompts import build_task_prompt
 from agent.repo_diff import collect_repo_patch
+from agent.criteria import extract_criteria, format_checklist
+from agent.guards import extended_repair_reason, patch_acceptable
 
 # -----------------------------
 # Config
@@ -121,7 +125,9 @@ def _resolve_inference_config(
 
 
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
-    return build_task_prompt(task_text=issue, repo_summary=repo_summary, preloaded_context=preloaded_context)
+    checklist = format_checklist(extract_criteria(issue))
+    base = build_task_prompt(task_text=issue, repo_summary=repo_summary, preloaded_context=preloaded_context)
+    return base + checklist if checklist else base
 
 
 # Minimum wall-clock headroom (seconds) needed to attempt a repair pass; below
@@ -288,17 +294,21 @@ def _python_test_outcome(repo_dir: str, patch_text: str) -> str:
     return "unknown"
 
 
-def _repair_reason(repo_dir: str, patch_text: str, check_tests: bool = True):
-    """(kind, message) when the first patch should be repaired, else None.
-    Cheap kinds 'empty'/'syntax' are the base king's checks. Behavioral kinds
-    'test_fail'/'no_test' target the gemini solver's real failure mode: it ships
-    many valid-but-undemonstrated/wrong patches the base king never rescues, and
-    the duel data shows that is exactly where it loses rounds (LLM score < 0.7)."""
+def _repair_reason(
+    repo_dir: str,
+    patch_text: str,
+    issue_text: str = "",
+    check_tests: bool = True,
+):
+    """(kind, message) when the first patch should be repaired, else None."""
     if not (patch_text or "").strip():
         return ("empty", "the current change set is empty; no fix was produced yet")
     broken = _syntax_errors(repo_dir, patch_text)
     if broken:
         return ("syntax", "the edited files contain syntax errors that must be fixed:\n- " + "\n- ".join(broken[:8]))
+    quality = extended_repair_reason(issue_text, patch_text)
+    if quality:
+        return ("quality", quality)
     if check_tests:
         outcome = _python_test_outcome(repo_dir, patch_text)
         if outcome == "fail":
@@ -349,19 +359,16 @@ def solve(
             task=build_initial_user_prompt(issue, "", ""),
         )
 
-        # Verification gate: the base agent submits on the first completion
-        # signal with no check, so it ships some empty or syntactically broken
-        # patches. If the emitted change is empty or leaves an edited Python file
-        # unparseable AND wall-clock budget remains, run one bounded repair pass
-        # and keep it only when it is strictly better (a
-        # non-empty patch with no syntax errors). Never worsen the first result.
+        # Repair pass: empty/broken/quality-guard/test-gated patches get one retry.
         repair_note = ""
         try:
             remaining = WALL_CLOCK_LIMIT_SECONDS - (time.monotonic() - started)
             # Behavioral probes run a test, so only run them when there is budget
             # for a repair afterwards -- never spend a round we cannot improve.
             can_repair = remaining >= VERIFY_REPAIR_MIN_BUDGET_SECONDS
-            reason = _repair_reason(repo_path, outcome.patch, check_tests=can_repair)
+            reason = _repair_reason(
+                repo_path, outcome.patch, issue_text=issue, check_tests=can_repair
+            )
             if reason is not None and can_repair:
                 kind, message = reason
                 orig_sources = _source_files(outcome.patch)
@@ -386,13 +393,14 @@ def solve(
                 # repair is DEMONSTRABLY better, never when it could be worse.
                 if rp.strip() and not _syntax_errors(repo_path, rp):
                     rtest = _python_test_outcome(repo_path, rp)
-                    if kind in ("empty", "syntax", "test_fail"):
-                        # first patch was empty/broken/test-failing: keep the repair
-                        # only if it is now non-empty, valid, and not test-failing.
-                        adopt = rtest != "fail"
-                    else:  # no_test: replace only if we GAINED a passing test AND
-                        # kept the original fix surface (so the fix is not lost).
-                        adopt = rtest == "pass" and orig_sources.issubset(_source_files(rp))
+                    if kind in ("empty", "syntax", "test_fail", "quality"):
+                        adopt = rtest != "fail" and patch_acceptable(rp)
+                    else:  # no_test
+                        adopt = (
+                            rtest == "pass"
+                            and orig_sources.issubset(_source_files(rp))
+                            and patch_acceptable(rp)
+                        )
                     if adopt:
                         outcome = repaired
                         repair_note = " (repair adopted: %s)" % kind
