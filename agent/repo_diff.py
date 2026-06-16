@@ -19,12 +19,19 @@ import subprocess
 _SCRATCH_NAME_RE = re.compile(
     r"^(?:"
     r"(?:fix|clean|cleanup|mock|update|patch|apply|munge|tmp|temp|scratch|"
-    r"run|do|gen|generate|rewrite|migrate)_[\w.-]*\.py"
-    r"|[\w.-]+\.(?:bak|orig|tmp|rej|swp|swo)"
+    r"run|do|gen|generate|rewrite|migrate|full|remove)_[\w.-]*\.py"
+    r"|[\w.-]+\.(?:bak|orig|tmp|rej|swp|swo|new|fixed)"
     r"|[\w.-]+~"
     r")$",
     re.IGNORECASE,
 )
+
+# Suffixes that make a file a SHADOW of a real file (e.g. cli.ts.new shadows
+# cli.ts). When the shadowed real file exists, the shadow is always a scratch
+# artifact and is removed unconditionally -- the duel judge penalizes these as
+# churn, and the base scrubber wrongly KEPT them because the real file's name
+# co-occurs in the kept diff.
+_SHADOW_SUFFIXES = (".new", ".fixed", ".orig", ".bak", ".rej", ".tmp", ".swp", ".swo")
 
 
 def collect_repo_patch(repo_dir: str) -> str:
@@ -58,10 +65,30 @@ def _scrub_scratch(repo_dir: str, untracked: list) -> None:
         kept_diff = _run_git(["diff", "--", "."], repo_dir) or ""
         keep_blob = kept_diff + "\n" + "\n".join(p for p in untracked if p not in candidates)
         for rel in candidates:
-            stem = os.path.splitext(os.path.basename(rel))[0]
-            if stem and (stem in keep_blob or os.path.basename(rel) in keep_blob):
-                continue
+            base = os.path.basename(rel)
             abs_path = os.path.join(repo_dir, rel)
+            # Shadow rule: X.new / X.fixed / X~ etc. whose real file X exists is a
+            # scratch copy -> remove unconditionally (the stem-reference guard
+            # below would otherwise keep it because X is in the kept diff).
+            shadow_of = None
+            if base.endswith("~"):
+                shadow_of = base[:-1]
+            else:
+                for suf in _SHADOW_SUFFIXES:
+                    if base.lower().endswith(suf):
+                        shadow_of = base[: -len(suf)]
+                        break
+            if shadow_of and os.path.exists(os.path.join(repo_dir, os.path.dirname(rel), shadow_of)):
+                try:
+                    if os.path.isfile(abs_path):
+                        os.remove(abs_path)
+                except OSError:
+                    pass
+                continue
+            # Munge-script rule: delete only when not referenced by a kept change.
+            stem = os.path.splitext(base)[0]
+            if stem and (stem in keep_blob or base in keep_blob):
+                continue
             try:
                 if os.path.isfile(abs_path):
                     os.remove(abs_path)

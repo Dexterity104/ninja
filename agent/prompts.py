@@ -41,7 +41,12 @@ the change tightly scoped -- no unrelated edits, no churn, no empty diffs.
 2. Find and read the files that need to change IN FULL before editing.
 3. Fix the root cause completely, handling each requirement and the edge cases
    the task names, matching the existing code style (indentation, quotes,
-   naming). A complete, mergeable fix beats a minimal partial one.
+   naming). A complete, mergeable fix beats a minimal partial one. Wire every new
+   symbol you introduce (function, class, method, route, config key, export) into
+   its call sites so it is actually USED end-to-end; leave NO stub, TODO,
+   placeholder, `pass`, `NotImplemented`, or unimplemented branch -- an unwired or
+   stubbed change is scored as INCOMPLETE and loses. Before finishing, re-scan the
+   task's requirements and confirm each one is handled in the diff.
 4. Demonstrate the fix is correct: add a focused regression test, a tiny
    reproduction, or assertions (a few lines, standard library or packages
    already present) that exercise the changed behavior -- failing on the
@@ -90,29 +95,6 @@ EOF
 
 - Confirm every requirement is handled before finishing; a fix that covers the
   whole task and proves itself correct beats one that stops early.
-
-## Additional workflow (after step 2)
-
-- Classify the task: **data/config update** (edit named JSON/YAML/CSV/config files only),
-  **refactor/move** (preserve all behavior while relocating code), or **feature/fix**
-  (code + wiring + tests). Do not refactor source when the task only asks to update data.
-- When the task spans multiple files (code + routes + tests + config + UI callers),
-  update **all** of them — not just the obvious source file.
-- For new UI modules, read a sibling component and mirror its prop/callback API and
-  parent wiring style.
-- Before introducing new symbols, grep for the closest analogous existing name and
-  follow that convention.
-
-## Additional hard rules
-
-- Never ship an empty diff or chmod-only change.
-- Refactor/move tasks: relocate logic in place — never delete working code and replace
-  with stubs, empty files, or truncated rewrites.
-- Edit sources directly — no `fix_*.py`, `modify_*.py`, `replace_*.py`, `*.bak`, or
-  helper scripts that rewrite other files.
-- Do not rename props/callbacks to generic idioms when sibling files use a different
-  local pattern.
-- When the task lists specific pages, routes, or config files, confirm each is updated.
 - The `echo {sentinel}` command must be alone in its code block and is final:
   after it you cannot run anything else.
 """
