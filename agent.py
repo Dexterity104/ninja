@@ -397,6 +397,15 @@ def _python_test_outcome(repo_dir: str, patch_text: str) -> str:
 def _repair_reason(repo_dir: str, patch_text: str, issue_text: str = "", check_tests: bool = True):
     if not (patch_text or "").strip():
         return ("empty", "the current change set is empty; no fix was produced yet")
+    if check_tests:
+        outcome = _python_test_outcome(repo_dir, patch_text)
+        if outcome == "fail":
+            return ("test_fail", "your own regression test currently FAILS, so the fix is wrong or incomplete; correct the fix until that test passes (never weaken the test).")
+        if outcome == "none" and _source_files(patch_text) and not _added_test_files(patch_text):
+            return ("no_test", "the fix changes source but includes no test proving it works; ADD one focused regression test that fails on the original bug and passes with your fix, and KEEP the existing source fix in place.")
+    cov = task_coverage_reason(issue_text, patch_text, repo_dir=repo_dir)
+    if cov:
+        return ("coverage", cov)
     broken = _syntax_errors(repo_dir, patch_text)
     if broken:
         return ("syntax", "the edited files contain syntax errors that must be fixed:\n- " + "\n- ".join(broken[:8]))
@@ -407,15 +416,6 @@ def _repair_reason(repo_dir: str, patch_text: str, issue_text: str = "", check_t
     )
     if q:
         return ("quality", q)
-    cov = task_coverage_reason(issue_text, patch_text)
-    if cov:
-        return ("coverage", cov)
-    if check_tests:
-        outcome = _python_test_outcome(repo_dir, patch_text)
-        if outcome == "fail":
-            return ("test_fail", "your own regression test currently FAILS, so the fix is wrong or incomplete; correct the fix until that test passes (never weaken the test).")
-        if outcome == "none" and _source_files(patch_text) and not _added_test_files(patch_text):
-            return ("no_test", "the fix changes source but includes no test proving it works; ADD one focused regression test that fails on the original bug and passes with your fix, and KEEP the existing source fix in place.")
     return None
 
 
@@ -426,6 +426,20 @@ def _build_repair_task(issue_text: str, reason: str) -> str:
         "Inspect the current state of the repository, then finish and correct "
         "the change so it fully and correctly solves the task. Re-read each "
         "edited region to confirm it is syntactically valid before submitting.\n\n"
+        "Original task:\n" + issue_text
+    )
+
+
+def _build_polish_task(issue_text: str, reason: str) -> str:
+    return (
+        "A previous attempt successfully solved the task below, passed all tests, "
+        "and has no syntax errors. Now, perform a polishing and refinement pass to "
+        "ensure the solution is absolutely perfect, elegant, and production-ready.\n\n"
+        "Specifically:\n"
+        "1. Remove any unrelated edits, debug prints, or temporary comments.\n"
+        "2. Ensure the code matches the existing style perfectly (indentation, quotes).\n"
+        "3. Ensure the added regression test is robust, clean, and covers all edge cases.\n"
+        "4. Make the changes as concise and precise as possible to minimize churn.\n\n"
         "Original task:\n" + issue_text
     )
 
@@ -465,6 +479,8 @@ def solve(
             remaining = WALL_CLOCK_LIMIT_SECONDS - (time.monotonic() - started)
             can_repair = remaining >= VERIFY_REPAIR_MIN_BUDGET_SECONDS
             reason = _repair_reason(repo_path, outcome.patch, issue_text=issue, check_tests=can_repair)
+            if reason is None and can_repair:
+                reason = ("polish", "The fix is correct and passes all tests, but we must polish and refine it to ensure it is of the highest quality, contains no unrelated churn, has clean and minimal edits, and is fully complete. Review your changes and make them perfect.")
             if reason is not None and can_repair:
                 kind, message = reason
                 orig_sources = _source_files(outcome.patch)
@@ -480,9 +496,13 @@ def solve(
                     max_log_chars=MAX_TOTAL_LOG_CHARS,
                     wall_clock_limit=remaining - WALL_CLOCK_RESERVE_SECONDS,
                 )
+                if kind == "polish":
+                    task_prompt = build_initial_user_prompt(_build_polish_task(issue, message), "", "")
+                else:
+                    task_prompt = build_initial_user_prompt(_build_repair_task(issue, message), "", "")
                 repaired = run_agent_loop(
                     config=repair_config,
-                    task=build_initial_user_prompt(_build_repair_task(issue, message), "", ""),
+                    task=task_prompt,
                 )
                 rp = repaired.patch
                 if rp.strip() and not _syntax_errors(repo_path, rp) and patch_acceptable(rp):
@@ -491,7 +511,7 @@ def solve(
                         adopt = rtest != "fail"
                     elif kind == "coverage":
                         adopt = rtest != "fail"
-                    elif kind in ("syntax", "test_fail", "quality"):
+                    elif kind in ("syntax", "test_fail", "quality", "polish"):
                         adopt = rtest != "fail" and orig_sources.issubset(_source_files(rp))
                     else:
                         gained_test = bool(_added_test_files(rp)) and not _added_test_files(outcome.patch)

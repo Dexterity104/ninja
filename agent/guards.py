@@ -80,7 +80,7 @@ def refactor_delete_reason(issue_text: str, patch_text: str) -> Optional[str]:
     return None
 
 
-def task_coverage_reason(issue_text: str, patch_text: str) -> Optional[str]:
+def task_coverage_reason(issue_text: str, patch_text: str, repo_dir: Optional[str] = None) -> Optional[str]:
     mentioned = []
     for match in _FILE_IN_ISSUE_RE.finditer(issue_text):
         path = match.group(1).strip().lstrip("./")
@@ -91,6 +91,23 @@ def task_coverage_reason(issue_text: str, patch_text: str) -> Optional[str]:
     touched = _changed_paths(patch_text)
     if not touched:
         return None
+
+    # Filter mentioned files to only those that actually exist in the repo or are being touched/created.
+    if repo_dir is not None:
+        import os
+        valid_mentioned = []
+        for m in mentioned:
+            # Check if the file exists on disk, or if it is a substring of any touched path,
+            # or if any touched path ends with/contains it (e.g. m is "views.py" and t is "app/views.py").
+            exists_on_disk = os.path.exists(os.path.join(repo_dir, m))
+            is_touched = any(t == m or t.endswith("/" + m) or m.endswith("/" + t) for t in touched)
+            if exists_on_disk or is_touched:
+                valid_mentioned.append(m)
+        mentioned = valid_mentioned
+
+    if not mentioned:
+        return None
+
     hit = sum(
         1
         for m in mentioned
