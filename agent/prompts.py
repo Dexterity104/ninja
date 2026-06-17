@@ -1,7 +1,3 @@
-"""Prompt templates for the coding agent: guide it to produce a correct,
-complete, well-verified fix that a careful maintainer would merge, scoped
-tightly to the issue and demonstrated with a focused test or reproduction."""
-
 COMPLETION_SENTINEL = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
 
 SYSTEM_PROMPT = """\

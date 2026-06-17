@@ -1,7 +1,4 @@
-"""Patch quality heuristics for the repair gate (size, artifacts, coverage)."""
-
 from __future__ import annotations
-
 import re
 from typing import Optional
 
@@ -10,10 +7,6 @@ _FILE_IN_ISSUE_RE = re.compile(
     re.I,
 )
 _MUNGE_PATH_RE = re.compile(
-    # NOTE: 'test' deliberately EXCLUDED -- conventional pytest names (test_*.py)
-    # would otherwise be flagged as munge artifacts, making patch_acceptable
-    # reject any patch that adds a regression test (the judge rewards test
-    # presence; the repo_diff scrubber excludes 'test' for the same reason).
     r"^(?:fix|clean|cleanup|replace|update|patch|apply|munge|modify|gen|generate|"
     r"rewrite|migrate|refactor)_[\w.-]+$",
     re.I,

@@ -1,7 +1,3 @@
-"""Minimal OpenAI-compatible chat client.
-Standard library only; the endpoint and token always come from the
-validator-managed proxy configuration passed into agent.solve()."""
-
 import json
 import time
 import urllib.error
@@ -15,15 +11,7 @@ class ModelQueryError(RuntimeError):
 
 
 class _TransientContentError(ModelQueryError):
-    """A 200-OK reply that is unusable (no choices / no content / empty).
-
-    Subclasses ModelQueryError so every existing catch site is unchanged, but
-    lets query() retry it in-place instead of forfeiting the round. This is the
-    Google finish_reason=error / no-content failure: the cached king never pays
-    it (solved once and replayed) but a fresh-every-round challenger pays it.
-    Floor insurance only -- provider stability is currently high so it recovers
-    few rounds, but it is free and prevents v7 self-forfeiting on a Google
-    relapse (a forfeit scores as a 0 and washes out of W/L)."""
+    """A 200-OK reply that is unusable (no choices / no content / empty)."""
     pass
 
 

@@ -1,7 +1,4 @@
-"""Build an acceptance checklist from issue bullets and generic integration hints."""
-
 from __future__ import annotations
-
 import re
 
 _INTEGRATION_RE = re.compile(

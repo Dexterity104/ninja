@@ -1,21 +1,7 @@
-"""Collect the repository patch the same way the validator harness does:
-tracked changes via `git diff --binary` plus untracked files via no-index
-diffs against /dev/null.
-
-Before collection we remove agent-created scratch artifacts (helper munge
-scripts, .bak/.orig/.tmp/.rej leftovers) that the diff judge penalizes as
-unnecessary churn. Only UNTRACKED files the agent itself created are eligible,
-and only when no kept change references them, so a legitimately-added source or
-test module is never touched. Pure stdlib, fail-open: any error skips scrubbing
-and collection proceeds unchanged."""
-
 import os
 import re
 import subprocess
 
-# Verb-prefixed munge scripts and editor/patch leftovers the model writes for
-# its own bookkeeping. NOTE: no "test_fix" / "test" verb here -- the prompt now
-# encourages a real regression test, so test files must never be scrubbed.
 _SCRATCH_NAME_RE = re.compile(
     r"^(?:"
     r"(?:fix|clean|cleanup|mock|update|patch|apply|munge|tmp|temp|scratch|"
@@ -26,11 +12,6 @@ _SCRATCH_NAME_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Suffixes that make a file a SHADOW of a real file (e.g. cli.ts.new shadows
-# cli.ts). When the shadowed real file exists, the shadow is always a scratch
-# artifact and is removed unconditionally -- the duel judge penalizes these as
-# churn, and the base scrubber wrongly KEPT them because the real file's name
-# co-occurs in the kept diff.
 _SHADOW_SUFFIXES = (".new", ".fixed", ".orig", ".bak", ".rej", ".tmp", ".swp", ".swo")
 
 
@@ -51,8 +32,7 @@ def _untracked_files(repo_dir: str) -> list:
 
 
 def _scrub_scratch(repo_dir: str, untracked: list) -> None:
-    """Delete agent-created scratch artifacts not referenced by a kept change.
-    Fail-open: never raises."""
+    """Delete agent-created scratch artifacts not referenced by a kept change."""
     try:
         if not untracked:
             return
@@ -67,9 +47,6 @@ def _scrub_scratch(repo_dir: str, untracked: list) -> None:
         for rel in candidates:
             base = os.path.basename(rel)
             abs_path = os.path.join(repo_dir, rel)
-            # Shadow rule: X.new / X.fixed / X~ etc. whose real file X exists is a
-            # scratch copy -> remove unconditionally (the stem-reference guard
-            # below would otherwise keep it because X is in the kept diff).
             shadow_of = None
             if base.endswith("~"):
                 shadow_of = base[:-1]
@@ -85,7 +62,6 @@ def _scrub_scratch(repo_dir: str, untracked: list) -> None:
                 except OSError:
                     pass
                 continue
-            # Munge-script rule: delete only when not referenced by a kept change.
             stem = os.path.splitext(base)[0]
             if stem and (stem in keep_blob or base in keep_blob):
                 continue

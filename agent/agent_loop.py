@@ -1,7 +1,4 @@
-"""The agent step loop: query the model, run one bash action, feed the
-observation back, finish when the agent echoes the completion sentinel.
-Uses a text-based action format."""
-
+from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass, field
